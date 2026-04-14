@@ -1,0 +1,356 @@
+plan_id: append-only-mode-20260414
+objective: |
+  Add a true append-only benchmark mode to elbencho. The user specifies --num/-n (file count)
+  and --timelimit/-t (duration). Workers open files with O_CREAT | O_WRONLY, seek to EOF,
+  then write blocks continuously via OffsetGenUnbounded until the phase timer fires.
+  Files grow without bound; no pre-sizing (no ftruncate/fallocate). Progress and final
+  results report total bytes written and effective throughput, same as existing write mode.
+  Works in directory mode only.
+created_at: "2026-04-14"
+created_by: gem-planner
+status: pending_approval
+branch: feat/append-only-mode
+research_confidence: high
+
+tldr: |
+  Three implementation tasks (ProgArgs flag, OffsetGenUnbounded, LocalWorker write path),
+  followed by an integration review and a build + smoke test. All tasks are sequential
+  due to compile-time dependencies. Highest risk is the pwrite/O_APPEND interaction on
+  Linux -- mitigated by opening without O_APPEND and initializing the offset generator
+  at current EOF via fstat.
+
+open_questions:
+  - Should --appendonly be silently compatible with --size (ignored) or should it emit a
+    warning when --size is also specified? Current plan: warn and ignore --size.
+  - Should shared-file mode (--sharedfile) be explicitly blocked, or is a doc-only note
+    sufficient? Current plan: add checkArgs assertion to block it.
+
+pre_mortem:
+  overall_risk_level: medium
+  critical_failure_modes:
+    - scenario: |
+        pwrite() with explicit offset ignores O_APPEND on Linux. If O_APPEND is set on the
+        fd but pwrite is called with an explicit offset, the write lands at the explicit
+        offset, not at EOF, causing silent data overlap between runs or workers.
+      likelihood: high
+      impact: high
+      mitigation: |
+        Do NOT open with O_APPEND. Open with O_CREAT | O_WRONLY. Obtain current EOF via
+        fstat(fd, &st) immediately after open; pass st.st_size as startOffset to
+        OffsetGenUnbounded. pwrite at advancing offsets from that baseline.
+    - scenario: |
+        checkArgs does not skip size validation when --appendonly is active. Existing
+        validation may reject size=0 or require --size to be set, breaking the flag.
+      likelihood: medium
+      impact: high
+      mitigation: |
+        In checkArgs(), when doAppendOnly is true: set fileSize to a large sentinel
+        (e.g. LLONG_MAX/2) to satisfy any internal assertions, and skip the normal
+        "size must be > 0" check. Emit a warning if the user also passed --size.
+    - scenario: |
+        Multiple workers assigned to the same file (shared-file mode) start at the same
+        EOF offset and produce overlapping writes, corrupting byte-count accounting.
+      likelihood: low
+      impact: medium
+      mitigation: |
+        Add a checkArgs() guard: if doAppendOnly && useSharedFile, throw ProgException
+        with a clear message. Document the dir-mode-only constraint in help text.
+    - scenario: |
+        OffsetGenUnbounded wraps or overflows before the time limit fires, causing the
+        worker to exit early or seek backward.
+      likelihood: low
+      impact: medium
+      mitigation: |
+        Use INT64_MAX/2 as the sentinel ceiling. At typical block sizes and storage
+        speeds that is >100 years of write time. Guard with a static_assert or runtime
+        check that currentOffset does not exceed the sentinel.
+  assumptions:
+    - elbencho dir mode assigns each file to exactly one worker (true by design today).
+    - The existing timelimit + isInterruptionRequested mechanism fires cleanly; no changes
+      needed to the stop path.
+    - atomicLiveOps.numBytesDone accumulates per-block already; throughput reporting
+      requires no changes.
+    - The build system (Makefile + AutoDetection.mk) does not require changes for a
+      header-only new class in OffsetGenerator.h.
+
+tasks:
+  - id: T01
+    title: Add --appendonly flag to ProgArgs
+    agent: gem-implementer
+    depends_on: []
+    status: pending
+    priority: high
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 60
+    requires_review: true
+    review_depth: standard
+    security_sensitive: false
+    files:
+      - source/ProgArgs.h
+      - source/ProgArgs.cpp
+    description: |
+      Add a new CLI flag --appendonly (long form only; no short alias) as a bool_switch
+      in ProgArgs.
+
+      **source/ProgArgs.h:**
+      1. Add `#define ARG_APPENDONLY_LONG "appendonly"` near the other ARG_* defines.
+      2. Add `bool doAppendOnly;` to the ProgArgs member section (group with other bool
+         flags).
+      3. Add `bool getDoAppendOnly() const { return doAppendOnly; }` getter.
+
+      **source/ProgArgs.cpp -- defineDefaults():**
+      4. Initialize `doAppendOnly = false;`.
+
+      **source/ProgArgs.cpp -- defineAllowedArgs() (bpo options block):**
+      5. Register:
+           (ARG_APPENDONLY_LONG, bpo::bool_switch(&this->doAppendOnly),
+            "Append-only write mode. Open files at EOF and write continuously until "
+            "--timelimit expires. Incompatible with read/verify phases and --sharedfile. "
+            "--size is ignored when this flag is active.")
+
+      **source/ProgArgs.cpp -- checkArgs():**
+      6. After existing phase-conflict checks, add:
+           if (doAppendOnly) {
+             if (!timeLimitSecs)
+               throw ProgException("--" ARG_APPENDONLY_LONG " requires --timelimit > 0");
+             if (doReadPhase || doVerifyPhase)
+               throw ProgException("--" ARG_APPENDONLY_LONG " is incompatible with "
+                                   "read/verify phases");
+             if (useSharedFile)
+               throw ProgException("--" ARG_APPENDONLY_LONG " requires directory mode "
+                                   "(incompatible with --sharedfile)");
+             if (fileSize && fileSize != DEFAULT_FILESIZE)
+               LOGGER(Log_NORMAL, "NOTE: --size is ignored when --appendonly is active\n");
+             fileSize = std::numeric_limits<int64_t>::max() / 2; // internal sentinel
+           }
+      7. If there is an existing unconditional "fileSize must be > 0" assertion, guard it
+         with `!doAppendOnly`.
+    acceptance_criteria:
+      - `elbencho --appendonly --timelimit 5 -n 1 /tmp/testdir` parses without error.
+      - `elbencho --appendonly -n 1 /tmp/testdir` (no --timelimit) exits with a clear
+        error message referencing --timelimit.
+      - `elbencho --appendonly --timelimit 5 --read -n 1 /tmp/testdir` exits with a
+        clear error message.
+      - `getDoAppendOnly()` returns true when flag is set, false otherwise.
+      - No regressions in existing checkArgs() paths (non-appendonly tests still pass).
+
+  - id: T02
+    title: Add OffsetGenUnbounded to OffsetGenerator.h
+    agent: gem-implementer
+    depends_on: []
+    status: pending
+    priority: high
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 50
+    requires_review: true
+    review_depth: standard
+    security_sensitive: false
+    files:
+      - source/toolkits/offsetgen/OffsetGenerator.h
+    description: |
+      Add a new concrete class `OffsetGenUnbounded` in source/toolkits/offsetgen/OffsetGenerator.h.
+      This class drives the append-only write loop by pretending there are always bytes left
+      to write; the loop exits only when isInterruptionRequested() fires.
+
+      **Design:**
+      - Inherit from the same base as OffsetGenSequential (or from OffsetGenerator directly,
+        whichever is the abstract base in that header).
+      - Constructor: `OffsetGenUnbounded(uint64_t blockSize, int64_t startOffset)`
+        - blockSize: bytes per pwrite call (same as the normal blockSize arg)
+        - startOffset: current EOF of the file at open time (from fstat)
+      - `getNumBytesLeftToSubmit()`: always return `std::numeric_limits<int64_t>::max() / 2`
+        (a sentinel large enough that it never reaches zero in practice).
+      - `getNextOffset()`: return `currentOffset`, then advance `currentOffset += blockSize`.
+      - `getCurrentOffset()`: return `currentOffset`.
+      - Internal state: `uint64_t blockSize_; int64_t currentOffset_;`
+      - No "exhausted" state; the loop in rwBlockSized() will exit via interrupt only.
+
+      **Overflow guard:**
+      Add an assertion (or a throw) in getNextOffset() if currentOffset_ would exceed
+      `std::numeric_limits<int64_t>::max() / 2`. At 10 GB/s that sentinel is unreachable
+      in any benchmark lifetime, but the guard is cheap insurance.
+
+      Do not modify OffsetGenSequential or any existing class.
+    acceptance_criteria:
+      - `OffsetGenUnbounded gen(4096, 0); gen.getNumBytesLeftToSubmit()` returns a value
+        greater than INT32_MAX (i.e. not zero or a small number).
+      - Calling getNextOffset() 1000 times from startOffset=0 with blockSize=4096 returns
+        offsets 0, 4096, 8192, ..., 4096*999 in order.
+      - File compiles cleanly with existing Makefile (`make -j` produces no errors or
+        warnings from OffsetGenerator.h).
+      - Existing offset generator tests (if any) continue to pass.
+
+  - id: T03
+    title: Modify LocalWorker to support append-only writes
+    agent: gem-implementer
+    depends_on:
+      - T01
+      - T02
+    status: pending
+    priority: high
+    estimated_effort: medium
+    estimated_files: 2
+    estimated_lines: 120
+    requires_review: true
+    review_depth: full
+    security_sensitive: false
+    files:
+      - source/workers/LocalWorker.cpp
+      - source/workers/LocalWorker.h
+    description: |
+      Wire --appendonly into the LocalWorker write path. All changes are guarded by
+      `progArgs->getDoAppendOnly()` so normal write paths are unaffected.
+
+      **1. getDirModeOpenFlags() (~line 7022 in LocalWorker.cpp):**
+      When doAppendOnly is true, return `O_CREAT | O_WRONLY` (NOT O_APPEND -- see
+      pre-mortem). Normal path is unchanged.
+
+      **2. dirModeOpenAndPrepFile() (~line 7086):**
+      After `open()` succeeds, add an append-only branch:
+        if (progArgs->getDoAppendOnly()) {
+          struct stat st;
+          if (fstat(fd, &st) == -1)
+            throw WorkerException("fstat failed: " + std::string(strerror(errno)));
+          appendStartOffset = st.st_size; // store for OffsetGenUnbounded init below
+          // Skip ftruncate and posix_fallocate entirely
+        } else {
+          // existing pre-sizing code (ftruncate / posix_fallocate)
+        }
+      Add `int64_t appendStartOffset = 0;` as a local variable (or pass it through the
+      call chain -- whichever fits the existing pattern). The value is needed when
+      constructing the OffsetGenerator.
+
+      **3. Construction of OffsetGenerator in the write path:**
+      Find where OffsetGenSequential is constructed for the dirModeIterateFiles write
+      phase (search for `new OffsetGenSequential` or the equivalent factory call). Add a
+      branch: when doAppendOnly, construct `new OffsetGenUnbounded(blockSize, appendStartOffset)`
+      instead.
+
+      **4. dirModeIterateFiles() assertion bypass (~line 2989):**
+      Locate the assertion/check `writeRes != fileSize` (or the equivalent check that
+      confirms the written byte count equals the expected file size). Guard it:
+        if (!progArgs->getDoAppendOnly()) {
+          // existing size assertion
+        }
+
+      **5. No changes to rwBlockSized():** The write loop already exits via
+      isInterruptionRequested(). With OffsetGenUnbounded returning a huge
+      numBytesLeftToSubmit, the loop runs until interrupted by the timer. This is the
+      correct behavior.
+
+      **LocalWorker.h:** If appendStartOffset needs to be a member (rather than a local),
+      add `int64_t appendOnlyStartOffset{0};` to the relevant section.
+
+      **Do not** change atomicLiveOps accounting -- it already accumulates bytes per block.
+    acceptance_criteria:
+      - Running `elbencho --appendonly --timelimit 3 -n 2 --block 1m /tmp/elbenchtest`
+        completes without assertion failures or crashes.
+      - Files in /tmp/elbenchtest grow in size during the run (observable via `ls -lh`
+        mid-run in a second terminal, or by comparing pre/post sizes).
+      - No ftruncate or fallocate is called (verify with strace or by reading the guarded
+        code path).
+      - Reported throughput (MB/s) and total bytes written are non-zero and plausible.
+      - A non-appendonly write run (e.g. `elbencho -w -s 1g -n 1 /tmp/elbenchtest2`)
+        still works correctly (regression guard).
+      - No existing unit/integration test breaks.
+
+  - id: T04
+    title: Integration review
+    agent: gem-reviewer
+    depends_on:
+      - T01
+      - T02
+      - T03
+    status: pending
+    priority: high
+    estimated_effort: small
+    estimated_files: 5
+    estimated_lines: 0
+    requires_review: false
+    review_depth: full
+    security_sensitive: false
+    files:
+      - source/ProgArgs.h
+      - source/ProgArgs.cpp
+      - source/toolkits/offsetgen/OffsetGenerator.h
+      - source/workers/LocalWorker.cpp
+      - source/workers/LocalWorker.h
+    description: |
+      End-to-end code review of all changes introduced by T01-T03 with focus on:
+
+      1. **Correctness of the pwrite offset logic** -- confirm O_APPEND is NOT used,
+         fstat is called after open, and OffsetGenUnbounded is initialized with st.st_size.
+      2. **checkArgs() completeness** -- verify all three guards (no --timelimit, read/verify
+         phase conflict, sharedfile conflict) are present and correct. Verify fileSize
+         sentinel does not break downstream code (e.g. any place fileSize is used as a
+         buffer size or loop bound).
+      3. **OffsetGenUnbounded overflow guard** -- confirm the sentinel ceiling check exists
+         and is reachable.
+      4. **No regressions** -- non-appendonly code paths are unchanged; all guards are
+         `if (doAppendOnly)`, not elided or inverted.
+      5. **Style consistency** -- new code matches existing elbencho code style (error
+         handling via ProgException/WorkerException, logging via LOGGER macro, etc.).
+      6. **Help text** -- --appendonly description is accurate and mentions the --timelimit
+         requirement.
+
+      Flag any issues as blocking or non-blocking. Non-blocking issues should be noted
+      for a follow-up but should not delay T05.
+    acceptance_criteria:
+      - All blocking issues are resolved before T05 begins.
+      - Reviewer confirms the pwrite/fstat/OffsetGenUnbounded offset initialization chain
+        is correct.
+      - Reviewer confirms no fileSize sentinel leaks into unintended code paths.
+
+  - id: T05
+    title: Build and smoke test
+    agent: gem-implementer
+    depends_on:
+      - T04
+    status: pending
+    priority: high
+    estimated_effort: small
+    estimated_files: 0
+    estimated_lines: 0
+    requires_review: false
+    review_depth: null
+    security_sensitive: false
+    files: []
+    description: |
+      Build the modified elbencho binary and run a two-stage smoke test.
+
+      **Build:**
+        cd <workspace_root>
+        make clean && make -j$(nproc) 2>&1 | tee /tmp/elbencho-build.log
+      Confirm: zero errors, zero new warnings introduced by the changed files.
+
+      **Smoke test -- append-only:**
+        mkdir -p /tmp/elbench-append-test
+        ./bin/elbencho --appendonly --timelimit 5 -n 4 --block 1m \
+          /tmp/elbench-append-test 2>&1 | tee /tmp/elbencho-smoke-append.log
+      Confirm:
+        - Exits cleanly after ~5 seconds
+        - Reports non-zero throughput and total bytes
+        - Files exist in /tmp/elbench-append-test and are non-empty
+        - No ASSERT, abort, or segfault in output
+
+      **Smoke test -- regression (normal write):**
+        mkdir -p /tmp/elbench-normal-test
+        ./bin/elbencho -w -s 64m -n 4 --block 1m \
+          /tmp/elbench-normal-test 2>&1 | tee /tmp/elbencho-smoke-normal.log
+      Confirm: completes normally with correct file sizes (4 x 64 MiB).
+
+      **Error path test:**
+        ./bin/elbencho --appendonly -n 1 /tmp/elbench-append-test
+      Confirm: exits with non-zero code and prints a message containing "timelimit".
+
+      **Cleanup:**
+        rm -rf /tmp/elbench-append-test /tmp/elbench-normal-test
+    acceptance_criteria:
+      - `make -j` completes with zero errors and zero new warnings.
+      - Append-only smoke test exits cleanly with non-zero throughput reported.
+      - Normal write regression test produces files of expected size.
+      - Missing --timelimit error path prints a useful message and returns non-zero exit
+        code.
+      - Build log and smoke test outputs are captured to /tmp/ for review.

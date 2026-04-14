@@ -1,0 +1,567 @@
+plan_id: append-only-mode-20260414
+objective: >
+  Understand how CLI arguments are defined and parsed in elbencho so we can
+  add new --append-only (or similar) flags.
+focus_area: progargs_cli_interface
+created_at: "2026-04-14"
+created_by: gem-researcher
+status: completed
+
+tldr: |
+  - All CLI argument registration lives in ProgArgs::defineAllowedArgs() using boost::program_options.
+  - Boolean flags use bpo::bool_switch(&this->member); no value token needed -- presence sets true.
+  - Boolean defaults are set in defineDefaults() (constructor calls this before defineAllowedArgs).
+  - The exact pattern for adding a new bool flag is: declare member -> initialize in defineDefaults() ->
+    register in defineAllowedArgs() -> add getter inliner in ProgArgs.h public section.
+  - No existing --append, doAppend, or O_APPEND flag in the write path; O_APPEND only appears in
+    log/results file opens (HTTPService.cpp, Statistics.cpp, OpsLogger.cpp).
+  - Workers access ProgArgs exclusively via a raw pointer stored in WorkersSharedData and mirrored
+    as a shortcut in Worker base class; no value copying.
+  - New flags for distributed mode MUST be added to getAsPropertyTreeForService() and
+    setFromPropertyTreeForService() to be serialized/deserialized to remote service instances.
+
+research_metadata:
+  methodology: >
+    Full read of ProgArgs.h (all ~810 lines) and ProgArgs.cpp (sections covering
+    defineAllowedArgs, defineDefaults, initImplicitValues, convertUnitStrings, checkArgs,
+    checkPathDependentArgs). Targeted grep searches for timelimit, fileSize, numFiles/numDirs,
+    O_APPEND, and ProgArgs pointer usage in workers. Spot reads of WorkersSharedData.h and Worker.h.
+  tools_used:
+    - read_file
+    - grep_search (via run_in_terminal)
+  scope: >
+    Full depth on ProgArgs.h and ProgArgs.cpp; spot reads on workers/WorkersSharedData.h,
+    workers/Worker.h, workers/WorkerManager.cpp.
+  confidence: high
+  coverage: 95
+
+files_analyzed:
+  - file: ProgArgs.h
+    path: source/ProgArgs.h
+    purpose: >
+      Central configuration class. Defines: all ARG_* macro constants, member variable declarations,
+      public getter inliners, and a few setter inliners. Also declares all private helper methods.
+    key_elements:
+      - element: ARG_TIMELIMITSECS_LONG
+        type: macro
+        location: "source/ProgArgs.h:209"
+        description: '"timelimit" -- the --timelimit CLI arg string'
+      - element: ARG_FILESIZE_LONG / ARG_FILESIZE_SHORT
+        type: macro
+        location: "source/ProgArgs.h:63-64"
+        description: '"size" / "s" -- the -s/--size CLI arg strings'
+      - element: ARG_NUMDIRS_LONG / ARG_NUMDIRS_SHORT
+        type: macro
+        location: "source/ProgArgs.h:116-117"
+        description: '"dirs" / "n"'
+      - element: ARG_NUMFILES_LONG / ARG_NUMFILES_SHORT
+        type: macro
+        location: "source/ProgArgs.h:118-119"
+        description: '"files" / "N"'
+      - element: timeLimitSecs
+        type: variable
+        location: "source/ProgArgs.h:~545"
+        description: "size_t; time limit in seconds per phase. 0 = disabled."
+      - element: fileSize
+        type: variable
+        location: "source/ProgArgs.h:~404"
+        description: "uint64_t; size per file in bytes after unit conversion."
+      - element: fileSizeOrigStr
+        type: variable
+        location: "source/ProgArgs.h:~405"
+        description: "std::string; raw user input string, e.g. '2M'. Parsed by UnitTk."
+      - element: numDirs
+        type: variable
+        location: "source/ProgArgs.h:~450"
+        description: "size_t; directories per thread after unit conversion."
+      - element: numDirsOrigStr
+        type: variable
+        location: "source/ProgArgs.h:~451"
+        description: "std::string; raw user input for numDirs."
+      - element: numFiles
+        type: variable
+        location: "source/ProgArgs.h:~452"
+        description: "size_t; files per directory per thread after unit conversion."
+      - element: numFilesOrigStr
+        type: variable
+        location: "source/ProgArgs.h:~453"
+        description: "std::string; raw user input for numFiles."
+      - element: doTruncate
+        type: variable
+        location: "source/ProgArgs.h:~395"
+        description: "bool; canonical example of a simple boolean mode flag (--trunc)."
+      - element: getTimeLimitSecs
+        type: function
+        location: "source/ProgArgs.h:~793"
+        description: "size_t getTimeLimitSecs() const { return timeLimitSecs; }"
+      - element: setTimeLimitSecs
+        type: function
+        location: "source/ProgArgs.h:~803"
+        description: >
+          void setTimeLimitSecs(size_t timeLimitSecs) { ... }
+          One of very few setters -- used by WorkerManager::prepareThreadsAndRun() to
+          temporarily disable the limit during phase transitions.
+      - element: getFileSize
+        type: function
+        location: "source/ProgArgs.h:~695"
+        description: "uint64_t getFileSize() const { return fileSize; }"
+      - element: getNumDirs / getNumFiles
+        type: function
+        location: "source/ProgArgs.h:~740,743"
+        description: "size_t getNumDirs/Files() const { return numDirs/Files; }"
+    language: C++
+    lines: 815
+
+  - file: ProgArgs.cpp
+    path: source/ProgArgs.cpp
+    purpose: >
+      Implements constructor/destructor, argument definition, default values, implicit value
+      derivation, unit string conversion, and multi-stage validation.
+    key_elements:
+      - element: ProgArgs::defineAllowedArgs
+        type: function
+        location: "source/ProgArgs.cpp:~200"
+        description: >
+          Registers all CLI options with boost::program_options. Two descriptors:
+          argsHiddenDescription (positional/internal) and argsGenericDescription (user-visible).
+          Options sorted alphabetically by CLI string for help output readability.
+      - element: ProgArgs::defineDefaults
+        type: function
+        location: "source/ProgArgs.cpp:~800"
+        description: >
+          Sets all member defaults before arg parsing. Called before defineAllowedArgs() in
+          constructor. Boolean flags default to false here explicitly.
+      - element: ProgArgs::initImplicitValues
+        type: function
+        location: "source/ProgArgs.cpp:~960"
+        description: >
+          Sets derived/implicit values after parsing. Uses argsVariablesMap.count() to detect
+          whether an arg was explicitly set vs defaulted (important for bool_switch args which
+          are always present in the map).
+      - element: ProgArgs::convertUnitStrings
+        type: function
+        location: "source/ProgArgs.cpp:~1075"
+        description: >
+          Converts *OrigStr members to machine-unit numeric counterparts via
+          UnitTk::numHumanToBytesBinary(). Called after parsing, before checkArgs().
+          fileSize, numDirs, numFiles all go through this stage.
+      - element: ProgArgs::checkArgs
+        type: function
+        location: "source/ProgArgs.cpp:~1116"
+        description: >
+          PRIMARY validation entry point. Called from constructor after convertUnitStrings().
+          Calls parseHosts(), parseGPUIDs(), parseRandAlgos(), parseS3Endpoints(),
+          parseAndCheckPaths(), and checkPathDependentArgs(). Throws ProgException on conflicts.
+      - element: ProgArgs::checkPathDependentArgs
+        type: function
+        location: "source/ProgArgs.cpp:~1340"
+        description: >
+          Secondary validation called from checkArgs() for checks requiring known BenchPathType.
+          Example: warns if --dirs is given but bench path is a file/bdev.
+      - element: timelimit registration
+        type: variable
+        location: "source/ProgArgs.cpp:740"
+        description: >
+          (ARG_TIMELIMITSECS_LONG, bpo::value(&this->timeLimitSecs), "Time limit in seconds...")
+          Takes a numeric value (size_t), no short form, default 0.
+      - element: filesize registration
+        type: variable
+        location: "source/ProgArgs.cpp:523"
+        description: >
+          (ARG_FILESIZE_LONG "," ARG_FILESIZE_SHORT, bpo::value(&this->fileSizeOrigStr), ...)
+          Binds to the *OrigStr member, not directly to fileSize. Supports unit suffixes.
+      - element: numfiles/numdirs registration
+        type: variable
+        location: "source/ProgArgs.cpp:413,417"
+        description: >
+          (ARG_NUMFILES_LONG "," ARG_NUMFILES_SHORT, bpo::value(&this->numFilesOrigStr), ...)
+          (ARG_NUMDIRS_LONG "," ARG_NUMDIRS_SHORT, bpo::value(&this->numDirsOrigStr), ...)
+          Both bind to *OrigStr. Range expansions are processed later.
+      - element: doTruncate registration (canonical bool example)
+        type: variable
+        location: "source/ProgArgs.cpp:~771"
+        description: >
+          (ARG_TRUNCATE_LONG, bpo::bool_switch(&this->doTruncate), "Truncate files to 0 size...")
+          Pure boolean -- no value token. Presence on CLI sets member to true.
+    language: C++
+    lines: ~2000
+
+  - file: WorkersSharedData.h
+    path: source/workers/WorkersSharedData.h
+    purpose: Struct shared across all worker threads. Holds pointer to ProgArgs.
+    key_elements:
+      - element: progArgs
+        type: variable
+        location: "source/workers/WorkersSharedData.h:40"
+        description: "ProgArgs* progArgs; -- raw pointer, set by WorkerManager."
+    language: C++
+    lines: ~60
+
+  - file: Worker.h
+    path: source/workers/Worker.h
+    purpose: Worker base class. Caches the ProgArgs pointer for fast access.
+    key_elements:
+      - element: progArgs
+        type: variable
+        location: "source/workers/Worker.h:40"
+        description: >
+          ProgArgs* progArgs; -- shortcut initialized from workersSharedData->progArgs in
+          Worker constructor. Workers call progArgs->getSomething() throughout.
+    language: C++
+    lines: ~230
+
+  - file: WorkerManager.cpp
+    path: source/workers/WorkerManager.cpp
+    purpose: Constructs workers and assigns shared data.
+    key_elements:
+      - element: workersSharedData.progArgs assignment
+        type: variable
+        location: "source/workers/WorkerManager.cpp:150"
+        description: "workersSharedData.progArgs = &progArgs; -- only pointer, no copy."
+    language: C++
+    lines: ~400
+
+patterns_found:
+  - category: boolean_flag_registration
+    pattern: bpo::bool_switch bound to a bool member defaulted to false
+    description: >
+      All on/off mode flags follow this exact pattern:
+      1. Declare `bool memberName;` in private section of ProgArgs class.
+      2. Default to false in defineDefaults(): `this->memberName = false;`
+      3. Register in defineAllowedArgs(): `(ARG_MACRO_LONG, bpo::bool_switch(&this->memberName), "help text")`
+      4. Add getter in public inliners section: `bool getMemberName() const { return memberName; }`
+      No short form needed for boolean flags (and typically not used).
+    examples:
+      - file: source/ProgArgs.cpp
+        location: "~771"
+        snippet: |
+          (ARG_TRUNCATE_LONG, bpo::bool_switch(&this->doTruncate),
+              "Truncate files to 0 size when opening for writing.")
+      - file: source/ProgArgs.cpp
+        location: "~240"
+        snippet: |
+          (ARG_DIRECTIO_LONG, bpo::bool_switch(&this->useDirectIO),
+              "Use direct IO (also known as O_DIRECT) ...")
+    prevalence: common
+
+  - category: value_with_unit_string
+    pattern: Pair of *OrigStr + numeric member, converted in convertUnitStrings()
+    description: >
+      Arguments that accept human-readable sizes/counts (e.g. "4K", "2M") always bind
+      to a std::string *OrigStr member. The numeric member is populated later via
+      UnitTk::numHumanToBytesBinary() in convertUnitStrings().
+    examples:
+      - file: source/ProgArgs.cpp
+        location: "523"
+        snippet: |
+          (ARG_FILESIZE_LONG "," ARG_FILESIZE_SHORT, bpo::value(&this->fileSizeOrigStr), ...)
+          // then in convertUnitStrings():
+          fileSize = UnitTk::numHumanToBytesBinary(fileSizeOrigStr, false);
+    prevalence: common
+
+  - category: arg_conflict_validation
+    pattern: throw ProgException in checkArgs() / checkPathDependentArgs()
+    description: >
+      All validation errors throw ProgException with a descriptive string. No return codes.
+      Mutually exclusive combinations are checked with simple boolean && logic.
+    examples:
+      - file: source/ProgArgs.cpp
+        location: "~1240"
+        snippet: |
+          if( (useRandomOffsets + useStridedAccess + doReverseSeqOffsets) > 1)
+              throw ProgException("Random, strided and reverse sequence offsets cannot be "
+                  "used together.");
+    prevalence: common
+
+  - category: implicit_value_derivation
+    pattern: initImplicitValues() sets members derived from combinations of other flags
+    description: >
+      When one flag implies another, or two flags together produce a third value,
+      this is done in initImplicitValues() using argsVariablesMap.count() to detect
+      explicit user intent vs defaults.
+    examples:
+      - file: source/ProgArgs.cpp
+        location: "~990"
+        snippet: |
+          if(argsVariablesMap.count(ARG_RWMIXPERCENT_LONG) )
+              useRWMixPercent = true;
+    prevalence: occasional
+
+  - category: naming_conventions_bool_flags
+    pattern: Prefix-based naming for boolean members
+    description: >
+      - `run*` prefix: phases to execute (runCreateFilesPhase, runReadPhase, etc.)
+      - `do*` prefix: modifiers for how a phase runs (doTruncate, doDirectVerify, doReadInline)
+      - `use*` prefix: enabling alternative IO/access modes (useDirectIO, useRandomOffsets)
+      - `show*` prefix: output/display toggles (showLatency, showCPUUtilization)
+      - `ignore*` prefix: error suppression (ignoreDelErrors, ignoreS3Errors)
+      An append-only mode flag would most likely use the `do*` or `use*` prefix (e.g. `doAppendOnly`
+      or `useAppendOnly`) based on existing conventions.
+    examples:
+      - file: source/ProgArgs.h
+        location: "~370-510"
+        snippet: "bool doTruncate; bool useDirectIO; bool runCreateFilesPhase;"
+    prevalence: common
+
+related_architecture:
+  components_relevant_to_domain:
+    - component: WorkersSharedData
+      responsibility: Shared mutable state and configuration pointer for all worker threads
+      location: source/workers/WorkersSharedData.h
+      relationship_to_domain: holds ProgArgs* progArgs; all workers reach config through this
+    - component: Worker (base class)
+      responsibility: Base class for LocalWorker and RemoteWorker
+      location: source/workers/Worker.h
+      relationship_to_domain: caches progArgs pointer shortcut; subclasses call progArgs->getX()
+    - component: WorkerManager
+      responsibility: Creates threads, assigns shared data, runs phases
+      location: source/workers/WorkerManager.cpp
+      relationship_to_domain: performs workersSharedData.progArgs = &progArgs assignment
+
+  interfaces_used_by_domain:
+    - interface: boost::program_options (bpo)
+      location: external library
+      usage_pattern: >
+        bpo::options_description + bpo::bool_switch() for flags,
+        bpo::value<T>() for typed arguments.
+    - interface: ProgException
+      location: source/ProgException.h
+      usage_pattern: thrown on validation failures in checkArgs() and checkPathDependentArgs()
+    - interface: UnitTk::numHumanToBytesBinary
+      location: source/toolkits/UnitTk.h
+      usage_pattern: converts "4K", "2M" strings to numeric bytes/count
+
+  data_flow_involving_domain: >
+    CLI args -> bpo::store/notify -> member vars set (defaults + parsed values) ->
+    initImplicitValues() -> convertUnitStrings() -> checkArgs() ->
+    ProgArgs object stored in Coordinator -> pointer set in WorkersSharedData ->
+    Workers read via progArgs->getXxx() calls during phase execution.
+
+  key_relationships_to_domain:
+    - from: WorkerManager
+      to: ProgArgs
+      relationship: holds reference; sets pointer in WorkersSharedData
+    - from: Worker (all subclasses)
+      to: ProgArgs
+      relationship: reads via cached pointer; no writes except setS3InterruptionRequested
+    - from: Statistics
+      to: ProgArgs
+      relationship: reads many config values for results output
+
+related_technology_stack:
+  languages_used_in_domain:
+    - C++17
+  frameworks_used_in_domain:
+    - name: boost::program_options
+      usage_in_domain: >
+        Entire CLI parsing layer. bpo::options_description holds all arg definitions.
+        bpo::variables_map used to check whether args were explicitly set vs defaulted
+        (via .count() -- critical for bool_switch flags which are always present).
+    - name: boost::property_tree
+      usage_in_domain: >
+        Serialization of ProgArgs for service mode (getAsPropertyTreeForService /
+        setFromPropertyTreeForService). Any new flag needing distributed mode support
+        must be added here.
+  libraries_used_in_domain:
+    - name: UnitTk (internal)
+      purpose_in_domain: Human-readable unit string to numeric conversion
+
+related_conventions:
+  naming_patterns_in_domain: >
+    ARG macros: ARG_<UPPERCASENAME>_LONG and optionally ARG_<...>_SHORT.
+    Member variables: camelCase with prefix (do*, use*, run*, show*, ignore*).
+    Getters: get<CamelCaseMemberName>() as const inliners in ProgArgs.h.
+    Setters: rare; only exists for timeLimitSecs and ignoreDelErrors.
+  structure_of_domain: >
+    Constructor calls: defineDefaults() -> defineAllowedArgs() -> bpo::store/notify ->
+    config file load (if any) -> initImplicitValues() -> convertUnitStrings() ->
+    checkCSVFileCompatibility() -> checkArgs().
+    All validation is in checkArgs() and checkPathDependentArgs().
+  error_handling_in_domain: >
+    All errors throw ProgException (unchecked, propagates to main()).
+    Soft warnings use LOGGER(Log_NORMAL, "NOTE: ..." << std::endl).
+  testing_in_domain: "No dedicated unit tests found for ProgArgs; covered by integration tests."
+  documentation_in_domain: >
+    In-code comments on member declarations. Help text is the primary user doc (printed via
+    boost::program_options). ARG macro naming includes a max length comment at the top of ProgArgs.h.
+
+related_dependencies:
+  internal:
+    - component: ProgException
+      relationship_to_domain: error signaling from validation
+      direction: outbound
+    - component: UnitTk
+      relationship_to_domain: unit string conversion
+      direction: outbound
+    - component: TranslatorTk
+      relationship_to_domain: fadvise/madvise/flock flag string to numeric conversion
+      direction: outbound
+    - component: SystemTk
+      relationship_to_domain: terminal width detection for help formatting
+      direction: outbound
+    - component: Workers (all)
+      relationship_to_domain: consume ProgArgs via pointer
+      direction: inbound
+    - component: Statistics
+      relationship_to_domain: reads ProgArgs for output formatting
+      direction: inbound
+  external:
+    - name: boost::program_options
+      purpose_for_domain: CLI parsing
+    - name: boost::property_tree
+      purpose_for_domain: service-mode config serialization
+
+# KEY FINDINGS FOR APPEND-ONLY FEATURE IMPLEMENTATION
+
+key_member_variables:
+  timelimit:
+    type: "size_t"
+    member: timeLimitSecs
+    orig_str_member: null  # no unit string; value is parsed directly as size_t
+    default: 0  # 0 = disabled
+    arg_long: "timelimit"
+    arg_short: null
+    registration: 'bpo::value(&this->timeLimitSecs)'
+    getter: "size_t getTimeLimitSecs() const { return timeLimitSecs; }"
+    setter: "void setTimeLimitSecs(size_t) -- exists, used by WorkerManager"
+    location_declaration: "source/ProgArgs.h:~545"
+    location_registration: "source/ProgArgs.cpp:740"
+
+  file_size:
+    type: "uint64_t"
+    member: fileSize
+    orig_str_member: fileSizeOrigStr  # user sees "2M", stored as uint64_t after conversion
+    default: 0
+    arg_long: "size"
+    arg_short: "s"
+    registration: 'bpo::value(&this->fileSizeOrigStr)'
+    getter: "uint64_t getFileSize() const { return fileSize; }"
+    conversion: "UnitTk::numHumanToBytesBinary(fileSizeOrigStr, false)"
+    location_declaration: "source/ProgArgs.h:~404-405"
+    location_registration: "source/ProgArgs.cpp:523"
+
+  num_dirs:
+    type: "size_t"
+    member: numDirs
+    orig_str_member: numDirsOrigStr
+    default: 1
+    arg_long: "dirs"
+    arg_short: "n"
+    registration: 'bpo::value(&this->numDirsOrigStr)'
+    getter: "size_t getNumDirs() const { return numDirs; }"
+    conversion: "UnitTk::numHumanToBytesBinary(numDirsOrigStr, false)"
+    location_declaration: "source/ProgArgs.h:~450"
+    location_registration: "source/ProgArgs.cpp:417"
+
+  num_files:
+    type: "size_t"
+    member: numFiles
+    orig_str_member: numFilesOrigStr
+    default: 1
+    arg_long: "files"
+    arg_short: "N"
+    registration: 'bpo::value(&this->numFilesOrigStr)'
+    getter: "size_t getNumFiles() const { return numFiles; }"
+    conversion: "UnitTk::numHumanToBytesBinary(numFilesOrigStr, false)"
+    location_declaration: "source/ProgArgs.h:~452"
+    location_registration: "source/ProgArgs.cpp:413"
+
+boolean_flag_pattern:
+  step1_declare: >
+    In ProgArgs class private section (source/ProgArgs.h, after existing bool members,
+    maintain alphabetical order within naming prefix group):
+      bool doAppendOnly;  // open files with O_APPEND for write phase
+  step2_default: >
+    In ProgArgs::defineDefaults() (source/ProgArgs.cpp, ~line 818):
+      this->doAppendOnly = false;
+  step3_define_macro: >
+    In ProgArgs.h ARG macro section (alphabetically):
+      #define ARG_APPENDONLY_LONG  "appendonly"
+  step4_register: >
+    In ProgArgs::defineAllowedArgs() (source/ProgArgs.cpp), insert in alphabetical order
+    (after /*al*/ block, before /*b*/ block):
+      (ARG_APPENDONLY_LONG, bpo::bool_switch(&this->doAppendOnly),
+          "Open files with O_APPEND flag in write phase. Each write appends to end of file.")
+  step5_getter: >
+    In ProgArgs public inliners section (source/ProgArgs.h), maintain alphabetical order:
+      bool getDoAppendOnly() const { return doAppendOnly; }
+  step6_service_serialization: >
+    If distributed mode support needed, add to:
+    - ProgArgs::getAsPropertyTreeForService(): tree.put("doAppendOnly", doAppendOnly)
+    - ProgArgs::setFromPropertyTreeForService(): doAppendOnly = tree.get("doAppendOnly", false)
+  step7_validation: >
+    In ProgArgs::checkArgs() (source/ProgArgs.cpp, ~line 1250), add conflict checks e.g.:
+      if(doAppendOnly && useRandomOffsets)
+          throw ProgException("Append-only mode cannot be used with random offsets.");
+      if(doAppendOnly && doTruncate)
+          throw ProgException("Append-only mode cannot be used with --trunc.");
+  step8_worker_usage: >
+    In worker write-path code (LocalWorker), call progArgs->getDoAppendOnly() to
+    conditionally add O_APPEND to the open() flags.
+
+existing_append_related_arguments: []
+# No doAppend, useAppend, appendOnly, or O_APPEND in write-path code.
+# O_APPEND appears only in:
+#   - source/HTTPService.cpp:49 (log file open)
+#   - source/Statistics.cpp:2540 (CSV results file open)
+#   - source/toolkits/OpsLogger.cpp:19 (ops log file open)
+# None of these are in the benchmark write path.
+
+progargs_worker_access_pattern:
+  storage: "Raw pointer ProgArgs* in WorkersSharedData::progArgs (source/workers/WorkersSharedData.h:40)"
+  assignment: "workersSharedData.progArgs = &progArgs; in WorkerManager (source/workers/WorkerManager.cpp:150)"
+  worker_shortcut: "ProgArgs* progArgs; in Worker base class (source/workers/Worker.h:40), initialized from workersSharedData->progArgs"
+  access_pattern: "Workers call progArgs->getXxx() const getters. No value copying. No ownership."
+  thread_safety: >
+    ProgArgs is read-only after construction (workers only call const getters), except for
+    setS3InterruptionRequested() which is atomic-bool-backed, and setTimeLimitSecs() called
+    only from WorkerManager before/after phase transitions (not during).
+
+validation_entry_points:
+  primary: "ProgArgs::checkArgs() -- source/ProgArgs.cpp:~1116"
+  secondary: "ProgArgs::checkPathDependentArgs() -- source/ProgArgs.cpp:~1340 (called from checkArgs, after bench path type is known)"
+  pattern: "throw ProgException(\"message\") for hard errors; LOGGER(Log_NORMAL, \"NOTE: ...\") for soft warnings"
+
+open_questions:
+  - question: >
+      Does the append-only mode need to work in custom tree mode (treefile)?
+    context: >
+      Custom tree mode uses different file-open code paths in LocalWorker. The append behavior
+      would need to be verified there as well.
+  - question: >
+      Should append-only imply a file size of 0 (no-truncate behavior) or should it be
+      orthogonal to --size?
+    context: >
+      doTruncate and doTruncToSize are existing flags that control file size at open time.
+      O_APPEND semantics do not truncate. A conflict check may be needed.
+  - question: >
+      Should append-only work in S3 mode?
+    context: >
+      S3 does not natively support append; it would need to be blocked or silently ignored.
+      The pattern exists in checkArgs(): if(doSomething && !s3EndpointsStr.empty()) throw ...
+  - question: >
+      Is distributed mode (service/master) support required?
+    context: >
+      If so, the flag must be added to getAsPropertyTreeForService() and
+      setFromPropertyTreeForService(). Searching for those methods was out of scope for this pass.
+
+gaps:
+  - area: LocalWorker write-path file-open code
+    description: >
+      Did not read LocalWorker.cpp to confirm exact location(s) where open() / O_WRONLY flags
+      are constructed. Multiple open call sites likely exist (dir mode vs file/bdev mode vs
+      inline read/write mode).
+    impact: >
+      The exact lines to modify in LocalWorker to add O_APPEND are not yet identified.
+      A second research pass or targeted grep (O_WRONLY, O_CREAT in LocalWorker.cpp) is needed
+      before implementation.
+  - area: getAsPropertyTreeForService / setFromPropertyTreeForService
+    description: >
+      Did not read serialization methods to confirm their structure and how to add a new field.
+    impact: >
+      Only impacts distributed mode. For local-only initial implementation this can be deferred.
+  - area: Configuration file support
+    description: >
+      Config file support is handled transparently by boost::program_options (same options as CLI
+      are accepted). No separate action needed unless there is custom parsing.
+    impact: Low -- no gap for standard flag registration.

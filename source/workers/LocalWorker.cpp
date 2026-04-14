@@ -1138,6 +1138,9 @@ void LocalWorker::initPhaseRWOffsetGen()
 
 	// note: in some cases these defs get overridden per-file later (e.g. for custom tree)
 
+	if(progArgs->getDoAppendOnly() && isWritePhase)
+		rwOffsetGen = std::make_unique<OffsetGenUnbounded>(blockSize, 0);
+	else
 	if(progArgs->getDoReverseSeqOffsets() || getS3ModeDoReverseSeqFallback() ) // seq backward
 		rwOffsetGen = std::make_unique<OffsetGenReverseSeq>(
 			fileSize, 0, blockSize);
@@ -3052,6 +3055,9 @@ void LocalWorker::dirModeIterateFiles()
 				fd = dirModeOpenAndPrepFile(benchPhase, pathFDs, pathFDsIndex,
 					currentPath.data(), openFlags, fileSize);
 
+				if(progArgs->getDoAppendOnly())
+					rwOffsetGen->reset(0, appendOnlyStartOffset);
+
 				// try-block to ensure that fd is closed in case of exception
 				try
 				{
@@ -3087,6 +3093,7 @@ void LocalWorker::dirModeIterateFiles()
 								"Path: " + pathVec[pathFDsIndex] + "/" + currentPath.data() + "; "
 								"SysErr: " + strerror(errno) );
 
+						if(!progArgs->getDoAppendOnly())
 						IF_UNLIKELY( (size_t)writeRes != fileSize)
 							throw WorkerException(std::string("Unexpected short file write. ") +
 								"Path: " + pathVec[pathFDsIndex] + "/" + currentPath.data() + "; "
@@ -7030,6 +7037,9 @@ int LocalWorker::getDirModeOpenFlags(BenchPhase benchPhase)
 
 	if(benchPhase == BenchPhase_CREATEFILES)
 	{
+		if(progArgs->getDoAppendOnly())
+			return O_CREAT | O_WRONLY;
+
 		openFlags = O_CREAT | O_RDWR;
 
 		if(progArgs->getDoTruncate() )
@@ -7081,33 +7091,45 @@ int LocalWorker::dirModeOpenAndPrepFile(BenchPhase benchPhase, const IntVec& pat
 	{
 		if(benchPhase == BenchPhase_CREATEFILES)
 		{
-			if(progArgs->getDoTruncToSize() )
+			if(progArgs->getDoAppendOnly())
 			{
-				int truncRes = ftruncate(fd, fileSize);
-				if(truncRes == -1)
-					throw WorkerException("Unable to set file size through ftruncate. "
+				struct stat st;
+				if(fstat(fd, &st) == -1)
+					throw WorkerException(std::string("fstat failed after open. ") +
 						"Path: " + currentPath + "; "
-						"Size: " + std::to_string(fileSize) + "; "
 						"SysErr: " + strerror(errno) );
+				appendOnlyStartOffset = st.st_size;
 			}
+			else
+			{
+				if(progArgs->getDoTruncToSize() )
+				{
+					int truncRes = ftruncate(fd, fileSize);
+					if(truncRes == -1)
+						throw WorkerException("Unable to set file size through ftruncate. "
+							"Path: " + currentPath + "; "
+							"Size: " + std::to_string(fileSize) + "; "
+							"SysErr: " + strerror(errno) );
+				}
 
-            if(progArgs->getDoPreallocFile() )
-            {
-                #if defined(__APPLE__)
-                    throw WorkerException("posix_fallocate is not supported on macOS. "
-                        "Path: " + currentPath + "; "
-                        "Size: " + std::to_string(fileSize) );
-                #else // linux
-                    // (note: posix_fallocate does not set errno.)
-                    int preallocRes = posix_fallocate(fd, 0, fileSize);
-                    if(preallocRes != 0)
-                        throw WorkerException(
-                            "Unable to preallocate file size through posix_fallocate. "
-                            "File: " + currentPath + "; "
-                            "Size: " + std::to_string(fileSize) + "; "
-                            "SysErr: " + strerror(preallocRes) );
-                #endif // linux
-            }
+				if(progArgs->getDoPreallocFile() )
+				{
+					#if defined(__APPLE__)
+						throw WorkerException("posix_fallocate is not supported on macOS. "
+							"Path: " + currentPath + "; "
+							"Size: " + std::to_string(fileSize) );
+					#else // linux
+						// (note: posix_fallocate does not set errno.)
+						int preallocRes = posix_fallocate(fd, 0, fileSize);
+						if(preallocRes != 0)
+							throw WorkerException(
+								"Unable to preallocate file size through posix_fallocate. "
+								"File: " + currentPath + "; "
+								"Size: " + std::to_string(fileSize) + "; "
+								"SysErr: " + strerror(preallocRes) );
+					#endif // linux
+				}
+			}
 		}
 
 		FileTk::fadvise<WorkerException>(fd, progArgs->getFadviseFlags(), currentPath.c_str() );

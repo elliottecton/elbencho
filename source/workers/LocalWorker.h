@@ -135,6 +135,7 @@ class LocalWorker : public Worker
 		CUFILE_HANDLE_DEREGISTER funcCuFileHandleDereg; // cuFile handle deregister
 		RW_RATE_LIMITER funcRWRateLimiter; // limit per-thread read or write throughput
 		std::unique_ptr<OffsetGenerator> rwOffsetGen; // r/w offset gen for phase-dependent funcs
+		int64_t appendOnlyStartOffset{0}; // per-file EOF offset for append-only mode
 		std::unique_ptr<RandAlgoInterface> randOffsetAlgo; // for random offsets
 		std::unique_ptr<RandAlgoInterface> randBlockVarAlgo; // for random block contents variance
 		std::unique_ptr<RandAlgoInterface> randBlockVarReseed; // reseed for golden prime block var

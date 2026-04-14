@@ -1,0 +1,649 @@
+plan_id: append-only-mode-20260414
+objective: >
+  Understand how elbencho stops workers after a time limit and how it tracks/reports
+  bytes written, so we can design append-only mode (run until time expires, files grow
+  as large as allowed).
+focus_area: time_stop_and_statistics
+created_at: "2026-04-14"
+created_by: gem-researcher
+status: completed
+
+tldr: |
+  - Time-limit stop is a polled cooperative mechanism: the main thread's live-stats loop calls
+    checkPhaseTimeLimit() each tick; when elapsed >= timeLimitSecs it sets a static bool
+    (WorkersSharedData::isPhaseTimeExpired) and calls interruptExecution() on every worker
+    (sets per-worker std::atomic_bool isInterruptionRequested = true).
+  - Workers check the flag with checkInterruptionRequest() AFTER each completed IO block
+    (post-pwrite/pread), so the current in-progress syscall always finishes cleanly before
+    the worker exits -- no partial blocks are written.
+  - Bytes written per worker are accumulated into AtomicLiveOps::numBytesDone (an atomic
+    uint64) immediately after each successful syscall return; final total is the sum across
+    all workers: phaseResults.opsTotal.numBytesDone.
+  - Phases (write/read/verify/delete) are discrete and sequential; --timelimit applies
+    independently per phase; append-only mode maps cleanly onto BenchPhase_CREATEFILES.
+  - No mechanism today tracks or reports per-file final sizes after an interrupted run;
+    the offset generator uses a fixed fileSize bound which must be bypassed for unbounded
+    append.
+
+research_metadata:
+  methodology: >
+    Hybrid retrieval: grep for key symbols (timeLimitSecs, isPhaseTimeExpired,
+    checkPhaseTimeLimit, atomicLiveOps, checkInterruptionRequest, isInterruptionRequested,
+    numBytesDone, generatePhaseResults) + sequential file reads of Statistics.cpp,
+    Statistics.h, Coordinator.cpp, Coordinator.h, WorkerManager.cpp, WorkersSharedData.h,
+    Worker.h, Worker.cpp, LocalWorker.cpp (relevant sections), LiveOps.h, LiveLatency.h.
+  tools_used:
+    - grep_search
+    - read_file
+    - file_search
+  scope: All source files under source/ and source/workers/ directly relevant to time-based
+    stop and statistics collection.
+  confidence: high
+  coverage: 95
+
+files_analyzed:
+  - file: ProgArgs.h
+    path: source/ProgArgs.h
+    purpose: Declares --timelimit CLI flag and stores timeLimitSecs member.
+    key_elements:
+      - element: ARG_TIMELIMITSECS_LONG
+        type: variable
+        location: source/ProgArgs.h:211
+        description: Macro mapping to the string "timelimit" (CLI arg name).
+      - element: timeLimitSecs
+        type: variable
+        location: source/ProgArgs.h:540
+        description: Per-phase time limit in seconds; 0 = disabled.
+      - element: getTimeLimitSecs
+        type: function
+        location: source/ProgArgs.h:829
+        description: Accessor used by WorkerManager to read the limit.
+      - element: setTimeLimitSecs
+        type: function
+        location: source/ProgArgs.h:839
+        description: Used to temporarily suppress the limit during sync/dropcaches phases.
+    language: c++
+    lines: ~900
+
+  - file: WorkersSharedData.h
+    path: source/workers/WorkersSharedData.h
+    purpose: Shared state for all worker threads and the coordinator.
+    key_elements:
+      - element: gotUserInterruptSignal
+        type: variable
+        location: source/workers/WorkersSharedData.h:36
+        description: Static bool; set to true by SIGINT/SIGTERM handler in Coordinator.
+      - element: isPhaseTimeExpired
+        type: variable
+        location: source/workers/WorkersSharedData.h:37
+        description: Static bool; set to true by WorkerManager::checkPhaseTimeLimit() when
+          elapsed time exceeds timeLimitSecs. Not atomic -- written under mutex lock by the
+          locked variant, written without lock by the unlocked variant (safe because it is
+          only set true, never reset during a phase).
+      - element: phaseStartT
+        type: variable
+        location: source/workers/WorkersSharedData.h:43
+        description: std::chrono::steady_clock::time_point set at phase start; used for
+          elapsed-time calculations in both the time-limit check and per-worker finish time.
+      - element: condition
+        type: variable
+        location: source/workers/WorkersSharedData.h:49
+        description: std::condition_variable used by main thread to wait for workers to
+          finish; also notified by interruptAndNotifyWorkers() to unblock the live-stats loop.
+    language: c++
+    lines: ~130
+
+  - file: WorkersSharedData.cpp
+    path: source/workers/WorkersSharedData.cpp
+    purpose: Definitions of static members and incNumWorkersDoneUnlocked.
+    key_elements:
+      - element: gotUserInterruptSignal
+        type: variable
+        location: source/workers/WorkersSharedData.cpp:7
+        description: Initialized to false.
+      - element: isPhaseTimeExpired
+        type: variable
+        location: source/workers/WorkersSharedData.cpp:8
+        description: Initialized to false.
+    language: c++
+    lines: 35
+
+  - file: WorkerManager.cpp
+    path: source/workers/WorkerManager.cpp
+    purpose: Orchestrates worker threads; owns the phase-time-limit check logic.
+    key_elements:
+      - element: checkPhaseTimeLimit
+        type: function
+        location: source/workers/WorkerManager.cpp:109
+        description: >
+          Called by the main thread from within the live-stats loop on each tick
+          (after condition.wait_until() returns due to timeout, not worker completion).
+          Computes elapsed = steady_clock::now() - workersSharedData.phaseStartT.
+          When elapsed >= timeLimitSecs: sets WorkersSharedData::isPhaseTimeExpired = true,
+          then calls interruptAndNotifyWorkers() (with mutex lock).
+          Note: There is also a locked variant checkPhaseTimeLimitUnlocked() for use when
+          the caller already holds the mutex.
+      - element: interruptAndNotifyWorkersUnlocked
+        type: function
+        location: source/workers/WorkerManager.cpp:20
+        description: >
+          Calls progArgs.setS3InterruptionRequested() (for S3 abort),
+          then calls worker->interruptExecution() for each worker in workerVec (sets
+          each worker's isInterruptionRequested atomic to true), then calls
+          workersSharedData.condition.notify_all() to wake up the live-stats wait.
+      - element: interruptAndNotifyWorkers
+        type: function
+        location: source/workers/WorkerManager.cpp:33
+        description: Mutex-locked wrapper around interruptAndNotifyWorkersUnlocked.
+    language: c++
+    lines: ~200
+
+  - file: Worker.h
+    path: source/workers/Worker.h
+    purpose: Base class for all workers; owns per-worker stats atomics and interruption flag.
+    key_elements:
+      - element: isInterruptionRequested
+        type: variable
+        location: source/workers/Worker.h:47
+        description: std::atomic_bool; set to true by interruptExecution() to ask this
+          worker to stop. Checked by checkInterruptionRequest() after each IO block.
+      - element: atomicLiveOps
+        type: variable
+        location: source/workers/Worker.h:48
+        description: AtomicLiveOps -- atomic counters for numEntriesDone, numBytesDone,
+          numIOPSDone for the current phase. Written by the worker after each IO operation.
+      - element: atomicLiveOpsReadMix
+        type: variable
+        location: source/workers/Worker.h:49
+        description: Same as atomicLiveOps but for rwmix read operations.
+      - element: interruptExecution
+        type: function
+        location: source/workers/Worker.h:219
+        description: inline; sets isInterruptionRequested = true.
+      - element: checkInterruptionRequest
+        type: function
+        location: source/workers/Worker.h:68
+        description: Throws WorkerInterruptedException if isInterruptionRequested is true.
+      - element: getAndAddLiveOps
+        type: function
+        location: source/workers/Worker.h:135
+        description: Reads atomicLiveOps and atomicLiveOpsReadMix atomics and sums them
+          into caller-provided LiveOps structs. Used by Statistics for both live and final
+          results.
+    language: c++
+    lines: ~240
+
+  - file: Worker.cpp
+    path: source/workers/Worker.cpp
+    purpose: Base worker logic including interruption check and phase-done signaling.
+    key_elements:
+      - element: checkInterruptionRequest
+        type: function
+        location: source/workers/Worker.cpp:74
+        description: >
+          Tests isInterruptionRequested with IF_UNLIKELY; throws
+          WorkerInterruptedException("Received friendly request to interrupt execution.")
+          if set. This is the cooperative stop point.
+      - element: finishPhase
+        type: function
+        location: source/workers/LocalWorker.cpp:1672
+        description: >
+          Records elapsedUSecVec[0] = duration_cast<microseconds>(now - phaseStartT).
+          Sets phaseFinished = true. Calls incNumWorkersDone() to notify coordinator.
+          This is always called (including when interrupted) so final elapsed time is
+          recorded correctly.
+    language: c++
+    lines: ~170
+
+  - file: LocalWorker.cpp
+    path: source/workers/LocalWorker.cpp
+    purpose: Per-thread I/O execution; contains the core write/read loops.
+    key_elements:
+      - element: rwBlockSized
+        type: function
+        location: source/workers/LocalWorker.cpp (line ~1688)
+        description: >
+          The primary sync I/O loop used when iodepth==1. Loops while
+          rwOffsetGen->getNumBytesLeftToSubmit() > 0. Each iteration:
+          1. Calls funcRWRateLimiter (may block to respect rate limit; also polls interruption
+             via &isInterruptionRequested passed as reference).
+          2. Calls funcPositionalWrite (pwrite) or funcPositionalRead (pread) -- this is the
+             blocking syscall that BLOCKS until the kernel finishes the IO.
+          3. If rwRes <= 0: error path, returns partial count.
+          4. Calls atomicLiveOpsReadMix.numBytesDone += rwRes or
+             atomicLiveOps.numBytesDone += rwRes (line 1765 / 1771).
+          5. Also atomicLiveOps.numIOPSDone++ (line 1772).
+          6. Calls checkInterruptionRequest() at line 1778 -- after the completed IO,
+             BEFORE requesting the next block from the offset generator.
+          Result: the in-progress write always completes; interruption is checked
+          after, so no partial (torn) block is ever written.
+      - element: atomicLiveOps.numBytesDone increment
+        type: pattern
+        location: source/workers/LocalWorker.cpp:1765,1771
+        description: Atomic add of rwRes (actual bytes transferred) into numBytesDone.
+          This counter retains the running total for the entire phase and is read by
+          Statistics::getLiveOps() and generatePhaseResults() via getAndAddLiveOps().
+    language: c++
+    lines: ~3000
+
+  - file: Coordinator.cpp
+    path: source/Coordinator.cpp
+    purpose: Orchestrates benchmark phases; handles exceptions from time limit and signals.
+    key_elements:
+      - element: runBenchmarkPhase
+        type: function
+        location: source/Coordinator.cpp:211
+        description: >
+          Sequence: checkInterruptionBetweenPhases() -> startNextPhase() ->
+          printLiveStats() [blocks; contains checkPhaseTimeLimit loop] ->
+          waitForWorkersDone() -> printPhaseResults() ->
+          cleanupWorkersAfterPhaseDone() -> checkInterruptionBetweenPhases().
+          The final checkInterruptionBetweenPhases() throws ProgTimeLimitException
+          if isPhaseTimeExpired is set.
+      - element: checkInterruptionBetweenPhases
+        type: function
+        location: source/Coordinator.cpp:211
+        description: >
+          Checks WorkersSharedData::gotUserInterruptSignal (throws ProgInterruptedException)
+          and WorkersSharedData::isPhaseTimeExpired (throws ProgTimeLimitException).
+          Called before and after each phase.
+      - element: ProgTimeLimitException catch
+        type: pattern
+        location: source/Coordinator.cpp:106
+        description: >
+          Caught in Coordinator::main(). Calls interruptAndNotifyWorkers() (graceful
+          redundant cleanup), does NOT set retVal = EXIT_FAILURE (time limit expiration
+          is treated as a normal/expected termination, not an error), then falls through
+          to joinall_and_exit.
+      - element: runSyncAndDropCaches
+        type: function
+        location: source/Coordinator.cpp:265
+        description: Temporarily sets timeLimitSecs=0 before sync/dropcaches phases
+          to prevent the time limit from aborting these infrastructure operations.
+      - element: allBenchPhasesArray / phase order
+        type: pattern
+        location: source/Coordinator.cpp:302
+        description: >
+          Phases run in this order (relevant subset):
+          BenchPhase_CREATEDIRS, BenchPhase_CREATEFILES (write),
+          BenchPhase_READFILES (read), BenchPhase_DELETEFILES, BenchPhase_DELETEDIRS.
+          Each enabled phase runs independently; --timelimit is per-phase (counter
+          resets each phase because phaseStartT is reset in startNextPhase).
+    language: c++
+    lines: ~450
+
+  - file: Statistics.cpp
+    path: source/Statistics.cpp
+    purpose: Live stats loop (contains time-limit poll); final phase results aggregation.
+    key_elements:
+      - element: loopSingleLineLiveStats
+        type: function
+        location: source/Statistics.cpp:~523
+        description: >
+          Main live-stats loop. Uses condition.wait_until(nextWakeupT) to sleep one tick.
+          On timeout (not worker completion): calls checkPhaseTimeLimit() -- this is the
+          only place in the codebase that polls the time limit in the standalone/single-line
+          path. Also in loopNoConsoleLiveStats and loopFullScreenLiveStats.
+      - element: getLiveOps
+        type: function
+        location: source/Statistics.cpp:~925
+        description: Sums atomicLiveOps across all workers by calling
+          worker->getAndAddLiveOps() for each worker. Used by live stats display and
+          by generatePhaseResults().
+      - element: generatePhaseResults
+        type: function
+        location: source/Statistics.cpp:1219
+        description: >
+          Called after all workers finish (or are interrupted) a phase.
+          Iterates workerVec; for each worker reads elapsedUSecVec to get
+          firstFinishUSec/lastFinishUSec and calls getAndAddLiveOps() to sum
+          bytes/entries/IOPS. Computes opsPerSec = opsTotal / lastFinishUSec.
+          The opsTotal.numBytesDone field is THE canonical total bytes written
+          for the phase.
+      - element: PhaseResults struct
+        type: class
+        location: source/Statistics.h:13
+        description: >
+          Holds opsTotal (LiveOps with numBytesDone), firstFinishUSec, lastFinishUSec,
+          opsPerSec (MiB/s), stonewall variants, CPU util, latency histograms.
+          No per-file size tracking.
+    language: c++
+    lines: ~1700
+
+  - file: LiveOps.h
+    path: source/LiveOps.h
+    purpose: >
+      Defines LiveOps (plain struct) and AtomicLiveOps (atomic struct) for tracking
+      bytes/entries/iops done.
+    key_elements:
+      - element: LiveOps::numBytesDone
+        type: variable
+        location: source/LiveOps.h:14
+        description: uint64_t; cumulative bytes written/read for the current phase.
+      - element: AtomicLiveOps::numBytesDone
+        type: variable
+        location: source/LiveOps.h:88
+        description: std::atomic_uint_fast64_t; worker-local atomic counter, incremented
+          after each IO syscall returns. Read by getLiveOps() and generatePhaseResults().
+      - element: getPerSecFromUSec
+        type: function
+        location: source/LiveOps.h:44
+        description: Divides total counts by elapsed microseconds to produce per-second
+          values. Used in generatePhaseResults() for final throughput.
+    language: c++
+    lines: ~115
+
+  - file: LiveLatency.h
+    path: source/LiveLatency.h
+    purpose: Tracks average IO latency per worker for live display; summed across workers.
+    key_elements:
+      - element: avgIOLatMicroSecsSum
+        type: variable
+        location: source/LiveLatency.h:15
+        description: Running sum of IO latencies in microseconds; divided by numAvgIOLatValues
+          to get per-tick average. Not directly relevant to append-only mode design.
+      - element: getAndAddOps
+        type: function
+        location: source/LiveLatency.h:47
+        description: Accumulates latency values from this worker into outSumLat.
+    language: c++
+    lines: ~90
+
+patterns_found:
+  - category: stop_mechanism
+    pattern: Cooperative polling after each IO block
+    description: >
+      Workers do NOT use POSIX signals or kernel-level cancellation to stop. The main
+      thread sets an atomic_bool (isInterruptionRequested) per worker and signals the
+      condition variable. Workers poll the flag themselves in checkInterruptionRequest()
+      after each completed block-sized IO operation. This ensures the currently executing
+      syscall (pwrite/pread) always runs to completion before the worker exits.
+    examples:
+      - file: source/workers/Worker.cpp
+        location: source/workers/Worker.cpp:74-78
+        snippet: |
+          void Worker::checkInterruptionRequest()
+          {
+              IF_UNLIKELY(isInterruptionRequested)
+                  throw WorkerInterruptedException("Received friendly request to interrupt execution.");
+          }
+      - file: source/workers/LocalWorker.cpp
+        location: source/workers/LocalWorker.cpp:1778
+        snippet: "checkInterruptionRequest(); // called after each completed IO block in rwBlockSized()"
+    prevalence: common
+
+  - category: time_limit_polling
+    pattern: Main-thread time-check inside live stats loop
+    description: >
+      The time-limit check lives in the main thread, not in worker threads.
+      Statistics::loopSingleLineLiveStats() (and loopNoConsoleLiveStats,
+      loopFullScreenLiveStats) call workerManager.checkPhaseTimeLimit() each time
+      condition.wait_until() returns due to timeout (not worker completion).
+      Polling granularity is controlled by getLiveStatsSleepMS() (default ~1s).
+    examples:
+      - file: source/Statistics.cpp
+        location: source/Statistics.cpp:~560
+        snippet: |
+          workerManager.checkPhaseTimeLimit(); // (interrupts workers if time limit exceeded)
+    prevalence: common
+
+  - category: bytes_accounting
+    pattern: Post-IO atomic increment per block
+    description: >
+      Bytes are counted by the actual bytes returned by the syscall (rwRes), not by
+      the requested block size. atomicLiveOps.numBytesDone += rwRes immediately after
+      the IO call succeeds. This means reported bytes always reflect actually-written
+      data, even for short writes.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: source/workers/LocalWorker.cpp:1771-1772
+        snippet: |
+          atomicLiveOps.numBytesDone += rwRes;
+          atomicLiveOps.numIOPSDone++;
+    prevalence: common
+
+  - category: phase_separation
+    pattern: Discrete sequential phases with per-phase setup/teardown
+    description: >
+      Each BenchPhase runs independently. Before a phase, workers call
+      initThreadPhaseVars(), initPhaseFileHandleVecs(), initPhaseRWOffsetGen(),
+      initPhaseFunctionPointers(). The offset generator (rwOffsetGen) is freshly
+      initialized each phase with the target fileSize. Phase state does not carry
+      over between phases.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: source/workers/LocalWorker.cpp:241
+        snippet: |
+          case BenchPhase_CREATEFILES:
+          case BenchPhase_READFILES:
+    prevalence: common
+
+  - category: offset_generator
+    pattern: Fixed-size (finite) offset generator drives write loop termination
+    description: >
+      rwBlockSized() loops while rwOffsetGen->getNumBytesLeftToSubmit() > 0.
+      The generator is initialized with fileSize as the total byte count.
+      When the time limit fires, the worker exits via exception before the
+      generator is exhausted. For append-only mode, this generator would need
+      to be infinite (or very large / unbounded).
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: source/workers/LocalWorker.cpp:1688 (approx)
+        snippet: |
+          while(rwOffsetGen->getNumBytesLeftToSubmit() )
+          {
+              // ... do IO, increment atomicLiveOps.numBytesDone, checkInterruptionRequest()
+          }
+    prevalence: common
+
+related_architecture:
+  components_relevant_to_domain:
+    - component: WorkersSharedData
+      responsibility: Shared state (phase start time, done counter, condition variable,
+        interrupt/timeout flags) for all workers and the main thread.
+      location: source/workers/WorkersSharedData.h
+      relationship_to_domain: Contains isPhaseTimeExpired and phaseStartT, both central
+        to the time-limit stop mechanism.
+    - component: WorkerManager
+      responsibility: Creates/destroys worker threads; owns checkPhaseTimeLimit() and
+        interruptAndNotifyWorkers(); manages phase lifecycle.
+      location: source/workers/WorkerManager.cpp
+      relationship_to_domain: Is the actor that detects time expiry and initiates the
+        cooperative stop.
+    - component: Coordinator
+      responsibility: Runs the outer benchmark lifecycle (phases, iterations, stats output).
+      location: source/Coordinator.cpp
+      relationship_to_domain: Calls runBenchmarkPhase() which coordinates the live-stats
+        loop (where checkPhaseTimeLimit is called) and catches ProgTimeLimitException.
+    - component: Statistics
+      responsibility: Live stats display (single-line, fullscreen, CSV) and final phase
+        results aggregation.
+      location: source/Statistics.cpp
+      relationship_to_domain: Houses the live-stats loop that calls checkPhaseTimeLimit();
+        generatePhaseResults() computes final bytes totals from per-worker atomics.
+    - component: LocalWorker
+      responsibility: Executes actual I/O (pwrite/pread) per worker thread.
+      location: source/workers/LocalWorker.cpp
+      relationship_to_domain: Calls checkInterruptionRequest() after each IO block;
+        updates atomicLiveOps.numBytesDone.
+    - component: OffsetGenerator (rwOffsetGen)
+      responsibility: Provides next offset and byte count for each IO operation; tracks
+        bytes remaining.
+      location: source/toolkits/offsetgen/
+      relationship_to_domain: Determines when a worker "naturally" finishes vs. when it
+        is interrupted by the time limit. For append-only mode, would need to be unbounded.
+
+  interfaces_used_by_domain:
+    - interface: AtomicLiveOps::numBytesDone
+      location: source/LiveOps.h:88
+      usage_pattern: Worker increments after each IO; Statistics reads via getAndAddLiveOps.
+    - interface: Worker::checkInterruptionRequest()
+      location: source/workers/Worker.cpp:74
+      usage_pattern: Called by LocalWorker after each block in rwBlockSized().
+    - interface: Worker::interruptExecution()
+      location: source/workers/Worker.h:219
+      usage_pattern: Called by WorkerManager for each worker when time limit fires.
+
+  data_flow_involving_domain: |
+    Phase start:
+      WorkerManager::startNextPhase() sets phaseStartT = steady_clock::now()
+                                         resets WorkersSharedData counters
+                                         signals workers via condition.notify_all()
+
+    Per IO block (worker thread):
+      pwrite/pread syscall completes
+        -> atomicLiveOps.numBytesDone += rwRes    [LocalWorker.cpp:1771]
+        -> atomicLiveOps.numIOPSDone++             [LocalWorker.cpp:1772]
+        -> checkInterruptionRequest()              [LocalWorker.cpp:1778]
+              if isInterruptionRequested: throw WorkerInterruptedException
+
+    Per live-stats tick (main thread, ~1s interval):
+      condition.wait_until(nextWakeupT) times out (workers still running)
+        -> workerManager.checkPhaseTimeLimit()    [Statistics.cpp:~560]
+              elapsed = now - phaseStartT
+              if elapsed >= timeLimitSecs:
+                isPhaseTimeExpired = true
+                for each worker: worker->interruptExecution()  [isInterruptionRequested=true]
+                condition.notify_all()
+
+    Worker interrupted:
+      WorkerInterruptedException caught in LocalWorker::run()
+        -> finishPhase()  [records elapsedUSecVec, calls incNumWorkersDone()]
+
+    Workers all done (condition fires):
+      live-stats loop exits
+        -> workerManager.waitForWorkersDone() returns
+        -> statistics.printPhaseResults()
+               generatePhaseResults():
+                 phaseResults.opsTotal.numBytesDone = sum of worker->atomicLiveOps.numBytesDone
+        -> checkInterruptionBetweenPhases() throws ProgTimeLimitException
+              caught in Coordinator::main() -> exit(EXIT_SUCCESS)
+
+  key_relationships_to_domain:
+    - from: Statistics::loopSingleLineLiveStats
+      to: WorkerManager::checkPhaseTimeLimit
+      relationship: calls
+    - from: WorkerManager::checkPhaseTimeLimit
+      to: Worker::interruptExecution
+      relationship: calls (for each worker)
+    - from: LocalWorker::rwBlockSized
+      to: Worker::checkInterruptionRequest
+      relationship: calls (after each IO block)
+    - from: Statistics::generatePhaseResults
+      to: Worker::getAndAddLiveOps
+      relationship: calls (to aggregate final bytes)
+
+related_technology_stack:
+  languages_used_in_domain:
+    - C++17
+  frameworks_used_in_domain:
+    - name: std::chrono (steady_clock)
+      usage_in_domain: Elapsed-time measurement for time-limit check and per-worker
+        finish time recording.
+    - name: std::atomic
+      usage_in_domain: AtomicLiveOps members (numBytesDone, numIOPSDone, numEntriesDone)
+        for lock-free per-worker byte counting; isInterruptionRequested for cooperative stop.
+    - name: std::condition_variable
+      usage_in_domain: Main thread waits on workers completing; interrupted via
+        condition.notify_all() when time limit fires.
+  libraries_used_in_domain:
+    - name: pwrite/pread (POSIX)
+      purpose_in_domain: Actual block-sized write/read syscalls in LocalWorker::rwBlockSized.
+
+related_conventions:
+  naming_patterns_in_domain: >
+    "atomic" prefix for atomic variant structs (AtomicLiveOps vs LiveOps).
+    "oUn locked" suffix for variants that assume caller holds the mutex.
+    "check*" prefix for validation/guard functions that throw.
+    Phase constants prefixed BenchPhase_.
+  structure_of_domain: >
+    Main thread owns the timer check (in Statistics live-stats loop).
+    Workers own per-worker stats atomics.
+    WorkerManager is the coordinator between the two for the stop action.
+  error_handling_in_domain: >
+    Time limit expiration is passed upward via C++ exception (ProgTimeLimitException),
+    NOT via error code. The coordinator treats it as a non-error exit.
+    Worker interruption propagates via WorkerInterruptedException, caught in
+    LocalWorker::run() which calls finishPhase() to keep the done-counter consistent.
+
+related_dependencies:
+  internal:
+    - component: OffsetGenerator (rwOffsetGen)
+      relationship_to_domain: Drives loop termination in rwBlockSized(); must be made
+        unbounded for append-only mode.
+      direction: outbound
+    - component: ProgArgs::fileSize
+      relationship_to_domain: Used by initPhaseRWOffsetGen() as the total byte count
+        per worker per file. Would not apply in append-only mode.
+      direction: outbound
+
+open_questions:
+  - question: >
+      Is phaseStartT reset between iterations when --iterations > 1? Or is it reset
+      only at the start of each distinct BenchPhase?
+    context: >
+      runBenchmarks() loops over enabledBenchPhasesVec per iteration. Each call to
+      runBenchmarkPhase() calls startNextPhase() which resets phaseStartT. So each
+      phase within each iteration gets its own clock. But append-only mode with
+      --timelimit + multiple iterations would be unusual to reason about.
+
+  - question: >
+      Does the aioBlockSized() path (iodepth > 1) also call checkInterruptionRequest()
+      after each block, or only rwBlockSized()?
+    context: >
+      This research focused on rwBlockSized() (iodepth==1). aioBlockSized() was not
+      examined in detail. For append-only mode, if iodepth > 1 is desired, the stop
+      granularity there should be verified.
+
+  - question: >
+      Does the time limit behave independently across separate phases in the same run,
+      or does a single timer span all phases?
+    context: >
+      Based on analysis, phaseStartT is reset per phase. The timer is therefore per-phase
+      independent. This is consistent with the behaviour in runSyncAndDropCaches() where
+      the limit is temporarily suppressed: the limit is clearly per-phase-call, not global.
+      However, this should be confirmed via a test if append-only mode will offer
+      multi-phase runs.
+
+  - question: >
+      What happens to partially-written files when a worker is interrupted mid-file
+      in dir mode? Is the file closed and its final size queryable?
+    context: >
+      In dir mode, the worker opens each file, writes fileSize bytes, then closes it.
+      If interrupted, the current file's fd will be closed in cleanup(). The kernel
+      will have seen all writes up to the interruption point. The file's actual size
+      on disk will be last-written-offset + last-block-size, which is computable from
+      atomicLiveOps.numBytesDone alone only implicitly. No explicit fstat or size
+      tracking is done after interruption.
+
+gaps:
+  - area: aioBlockSized (async IO path, iodepth > 1)
+    description: The aioBlockSized() function was not examined for its interruption
+      check frequency or granularity.
+    impact: Moderate -- append-only mode with high iodepth would need the same safety
+      guarantees (no torn blocks at stop); not confirmed for async path.
+
+  - area: Per-file final size reporting
+    description: There is no mechanism in the current codebase to report the final size
+      of individual files after an interrupted run. opsTotal.numBytesDone gives the
+      aggregate but not per-file distribution.
+    impact: High for append-only feature design -- if users need to know how large each
+      file grew, elbencho would need new instrumentation (e.g., final fstat per file,
+      or tracking of last-write-offset per file).
+
+  - area: File open flags for append
+    description: LocalWorker uses pwrite() with explicit offsets, not O_APPEND.
+      The offset is computed by rwOffsetGen starting from 0. For true append-only
+      mode (where the file may already contain data from a previous run), the starting
+      offset would need to reflect the existing file size.
+    impact: High -- this is a fundamental design requirement for append-only mode.
+      pwrite() at offset 0 always overwrites; to append to existing content, either
+      O_APPEND with write() or pwrite() at current EOF must be used.
+
+  - area: Interrupt check in rate limiter (preRWRateLimiter)
+    description: The funcRWRateLimiter is called before the IO syscall and receives
+      &isInterruptionRequested as a reference parameter. The internal behavior of the
+      rate limiter when interrupted (does it spin, return early, etc.) was not examined.
+    impact: Low for correctness (checkInterruptionRequest() after the block provides
+      the stop guarantee regardless); moderate for latency of actual stop when rate
+      limiting is active.

@@ -25,6 +25,7 @@ namespace bpt = boost::property_tree;
         and "_LONG" arguments with parameters to a max of 12 chars, as the description column
         in the help output otherwise gets too small. */
 #define ARG_ALTHTTPSERVER_LONG		"althttpsvc"
+#define ARG_APPENDONLY_LONG			"appendonly"
 #define ARG_BENCHLABEL_LONG			"label"
 #define ARG_BENCHPATHS_LONG			"path"
 #define ARG_BLOCK_LONG	 			"block"
@@ -377,6 +378,7 @@ class ProgArgs
 		std::string csvFilePath; // phase results file path for csv format (or empty for none)
 		bool disableLiveStats; // disable live stats
 		bool disablePathBracketsExpansion; // true to disable square brackets expansion for paths
+		bool doAppendOnly; // open files at current EOF and write until timeLimitSecs expires
 		bool doDirectVerify; // verify data integrity by reading immediately after write
 		bool doDirSharing; // workers use same dirs in dir mode (instead of unique dir per worker)
 		bool doInfiniteIOLoop; // let each thread loop on its phase work infinitely
@@ -662,6 +664,7 @@ class ProgArgs
 		const PathStore& getCustomTreeFilesShared() const { return customTree.filesShared; }
         std::string getCSVFilePath() const { return csvFilePath; }
         bool getDisableLiveStats() const { return disableLiveStats; }
+        bool getDoAppendOnly() const { return doAppendOnly; }
         bool getDoDirSharing() const { return doDirSharing; }
         bool getDoDirectVerify() const { return doDirectVerify; }
         bool getDoInfiniteIOLoop() const { return doInfiniteIOLoop; }

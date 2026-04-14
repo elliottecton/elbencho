@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <libgen.h>
+#include <limits>
 #include <openssl/sha.h>
 #include <regex>
 #include <string>
@@ -199,6 +200,11 @@ void ProgArgs::defineAllowedArgs()
 /*al*/	(ARG_ALTHTTPSERVER_LONG, bpo::bool_switch(&this->useAlternativeHTTPService),
 			"Use alternative implementation of HTTP service (for testing).")
 #endif // ALTHTTPSVC_SUPPORT
+/*ap*/	(ARG_APPENDONLY_LONG, bpo::bool_switch(&this->doAppendOnly),
+			"Append-only write mode. Open files at current EOF and write continuously until "
+			"\"--" ARG_TIMELIMITSECS_LONG "\" expires. Incompatible with read/verify phases "
+			"and shared file/bdev mode. \"--" ARG_FILESIZE_LONG "\" is ignored when this "
+			"flag is active.")
 /*b*/   (ARG_BLOCK_LONG "," ARG_BLOCK_SHORT, bpo::value(&this->blockSizeOrigStr),
             "Number of bytes to read/write in a single operation. Each thread needs to keep "
             "one block in RAM (or multiple blocks if \"--" ARG_IODEPTH_LONG "\" is used), so "
@@ -862,6 +868,7 @@ void ProgArgs::defineDefaults()
 	this->showCPUUtilization = false;
     this->svcReadyWaitSec = 5;
 	this->svcUpdateIntervalMS = 500;
+	this->doAppendOnly = false;
 	this->doTruncToSize = false;
 	this->doPreallocFile = false;
 	this->doDirSharing = false;
@@ -1321,6 +1328,25 @@ void ProgArgs::checkArgs()
     if( (flockType == ARG_FLOCK_FULL) && (ioDepth > 1) && runCreateFilesPhase)
         throw ProgException("Full file write locks cannot be used together with async IO");
 
+    if(doAppendOnly)
+    {
+        if(!timeLimitSecs)
+            throw ProgException("--" ARG_APPENDONLY_LONG " requires --" ARG_TIMELIMITSECS_LONG
+                " to be set to a value greater than zero.");
+        if(runReadPhase || integrityCheckSalt)
+            throw ProgException("--" ARG_APPENDONLY_LONG " is incompatible with read or "
+                "verify phases (--" ARG_READ_LONG " / --" ARG_INTEGRITYCHECK_LONG ").");
+        if(useMmap)
+            throw ProgException("--" ARG_APPENDONLY_LONG " is incompatible with --"
+                ARG_MMAP_LONG ".");
+        if(fileSize && fileSize != (uint64_t)std::numeric_limits<int64_t>::max() / 2)
+            LOGGER(Log_NORMAL, "NOTE: --size is ignored when --" ARG_APPENDONLY_LONG
+                " is active." << std::endl);
+        fileSize = (uint64_t)std::numeric_limits<int64_t>::max() / 2;
+        runCreateDirsPhase = true;  // append-only implicitly creates dirs (idempotent)
+        runCreateFilesPhase = true; // append-only implicitly activates the write phase
+    }
+
     if(!hostsVec.empty() )
         return;
 
@@ -1354,6 +1380,10 @@ void ProgArgs::checkPathDependentArgs()
             throw ProgException("Direct IO is not supported on macOS. "
                 "Consider using \"--" ARG_FADVISE_LONG "=" ARG_FADVISE_FLAG_DONTNEED_NAME "\".");
     #endif // apple
+
+	if(doAppendOnly && (benchPathType != BenchPathType_DIR) )
+		throw ProgException("--" ARG_APPENDONLY_LONG " requires directory mode and is "
+			"incompatible with shared file or block device benchmarks.");
 
 	if( ( (benchPathType != BenchPathType_DIR) || !treeFilePath.empty() ) &&
 		(argsVariablesMap.count(ARG_NUMDIRS_LONG) || argsVariablesMap.count(ARG_NUMDIRS_SHORT) ) )
@@ -1418,7 +1448,7 @@ void ProgArgs::checkPathDependentArgs()
 	}
 
 	// reduce file size to multiple of block size for directIO and random IO
-	if( (useDirectIO || useRandomOffsets || useStridedAccess) && fileSize &&
+	if( !doAppendOnly && (useDirectIO || useRandomOffsets || useStridedAccess) && fileSize &&
 	    (runCreateFilesPhase || runReadPhase) && (fileSize % blockSize) )
 	{
 		size_t newFileSize = fileSize - (fileSize % blockSize);
@@ -1956,7 +1986,7 @@ void ProgArgs::prepareFileSize(int fd, std::string& path)
 
 		off_t currentFileSize = statBuf.st_size;
 
-		if(!fileSize && !statBuf.st_size && (runReadPhase || runCreateFilesPhase) )
+		if(!doAppendOnly && !fileSize && !statBuf.st_size && (runReadPhase || runCreateFilesPhase) )
 			throw ProgException("File size must not be 0 when benchmark path is a file. "
 				"File: " + path);
 

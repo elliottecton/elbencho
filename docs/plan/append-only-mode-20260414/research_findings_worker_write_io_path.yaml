@@ -1,0 +1,580 @@
+plan_id: append-only-mode-20260414
+objective: >
+  Understand how elbencho currently performs file writes so we can add a mode
+  where files grow unboundedly (append-only) for a fixed duration.
+focus_area: worker_write_io_path
+created_at: "2026-04-14"
+created_by: gem-researcher
+status: completed
+
+tldr: |
+  - Primary write loop entry points are dirModeIterateFiles() (dir mode) and
+    fileModeIterateFilesSeq() / fileModeIterateFilesRand() (file/bdev mode),
+    all of which call the common inner loop rwBlockSized() via funcRWBlockSized.
+  - Termination is driven entirely by the OffsetGenerator's numBytesLeft counter
+    reaching zero; the outer file/dir loops iterate over a fixed file count with
+    a fixed fileSize per file sourced from progArgs->getFileSize().
+  - File open flags for writes are O_CREAT | O_RDWR (plus optional O_TRUNC);
+    O_APPEND is NOT used anywhere in the write IO path.
+  - File size is pre-determined and pre-allocated via ftruncate() or
+    posix_fallocate() before any IO starts; pwrite() is used (positional),
+    so offset is explicitly supplied by the OffsetGenerator each call.
+  - Time-based termination path: WorkerManager::checkPhaseTimeLimit() sets
+    WorkersSharedData::isPhaseTimeExpired and calls interruptAndNotifyWorkers(),
+    which sets isInterruptionRequested on each worker; workers check this flag
+    every INTERRUPTION_CHECK_INTERVAL (128) iterations via checkInterruptionRequest().
+  - An --infloop mode exists (doInfiniteIOLoop) that replays the phase in a tight
+    loop, but each replay still writes a fixed fileSize per file from offset 0 --
+    it does not grow the file.
+  - No existing append-only, unbounded-growth, or end-of-file tracking logic
+    exists in the write path.
+
+research_metadata:
+  methodology: >
+    3-pass hybrid retrieval: grep_search for exact symbols/flags, read_file for
+    full function bodies at targeted line ranges, semantic context from header
+    files. Pass 1 broad (file structure, open flags, class layout). Pass 2
+    (write loop bodies, offset generator, ftruncate/fallocate sites). Pass 3
+    (termination path, WorkerManager, infinite loop logic, pwrite wrappers).
+  tools_used:
+    - list_dir
+    - grep_search
+    - read_file
+  scope: >
+    Every file in source/workers/. Key read functions in source/ProgArgs.cpp,
+    source/ProgArgs.h, source/workers/WorkerManager.cpp,
+    source/workers/WorkersSharedData.h, source/workers/Worker.cpp,
+    source/toolkits/offsetgen/OffsetGenerator.h.
+  confidence: high
+  coverage: 95
+
+files_analyzed:
+  - file: LocalWorker.cpp
+    path: source/workers/LocalWorker.cpp
+    purpose: >
+      Core local-thread worker. Contains all write loop implementations, file open
+      logic, ftruncate/fallocate calls, pwrite wrapper, and offset generator wiring.
+    key_elements:
+      - element: run
+        type: function
+        location: "source/workers/LocalWorker.cpp:176"
+        description: >
+          Thread entry point. Outer loop waits for each phase; dispatches to
+          dirModeIterateFiles, fileModeIterateFilesSeq, fileModeIterateFilesRand,
+          etc. for BenchPhase_CREATEFILES. Contains the doInfiniteIOLoop do-while.
+      - element: dirModeIterateFiles
+        type: function
+        location: "source/workers/LocalWorker.cpp:2989"
+        description: >
+          Iterates numDirs × numFiles nested loops. Opens each file via
+          dirModeOpenAndPrepFile(), calls funcRWBlockSized(), checks that
+          writeRes == fileSize (WILL NEED CHANGE for append mode).
+          Resets rwOffsetGen to [0..fileSize] before each file.
+      - element: fileModeIterateFilesSeq
+        type: function
+        location: "source/workers/LocalWorker.cpp:3531"
+        description: >
+          Divides the global block space across numDataSetThreads. For each file
+          slice, resets rwOffsetGen to the thread's [start..end] range, then calls
+          funcRWBlockSized(). Validates writeRes == currentIOLen.
+      - element: fileModeIterateFilesRand
+        type: function
+        location: "source/workers/LocalWorker.cpp:3445"
+        description: >
+          Rebuilds rwOffsetGen with a per-thread random range, then calls
+          funcRWBlockSized() once for the entire range.
+      - element: rwBlockSized
+        type: function
+        location: "source/workers/LocalWorker.cpp:1658"
+        description: >
+          Core inner write loop. Loops on rwOffsetGen->getNumBytesLeftToSubmit() != 0.
+          Each iteration: calls funcRWRateLimiter, funcPreWriteBlockModifier,
+          funcPreWriteCudaMemcpy, then funcPositionalWrite (pwrite by default) with
+          explicit offset from rwOffsetGen->getNextOffset(). Calls
+          checkInterruptionRequest() at the end of each iteration.
+          Calls rwOffsetGen->addBytesSubmitted(rwRes) to advance offset.
+          Returns total bytes written (rwOffsetGen->getNumBytesTotal()) on success.
+      - element: aioBlockSized
+        type: function
+        location: "source/workers/LocalWorker.cpp:~1830"
+        description: >
+          Async IO variant of rwBlockSized using libaio. Same outer loop structure
+          driven by rwOffsetGen, same termination condition.
+      - element: getDirModeOpenFlags
+        type: function
+        location: "source/workers/LocalWorker.cpp:7022"
+        description: >
+          Returns O_CREAT | O_RDWR for CREATEFILES phase (+ O_TRUNC if doTruncate).
+          Returns O_RDONLY for READFILES phase. No O_APPEND.
+      - element: dirModeOpenAndPrepFile
+        type: function
+        location: "source/workers/LocalWorker.cpp:7060"
+        description: >
+          Opens file with openat(). If doTruncToSize: calls ftruncate(fd, fileSize)
+          before IO. If doPreallocFile: calls posix_fallocate(fd, 0, fileSize).
+          Returns fd to the caller; mmap setup also happens here.
+      - element: pwriteWrapper
+        type: function
+        location: "source/workers/LocalWorker.cpp:2484"
+        description: >
+          Thin wrapper around pwrite(fd, buf, nbytes, offset). The offset is the
+          OffsetGenerator's currentOffset -- fully positional, no seek.
+      - element: initPhaseRWOffsetGen
+        type: function
+        location: "source/workers/LocalWorker.cpp:1120"
+        description: >
+          Constructs the rwOffsetGen unique_ptr based on progArgs flags. Default
+          sequential forward: OffsetGenSequential(fileSize, 0, blockSize).
+          All generators are initialized with fileSize as their total byte count.
+      - element: initThreadFDVec
+        type: function
+        location: "source/workers/LocalWorker.cpp:872"
+        description: >
+          In file/bdev mode with useNoFDSharing: opens each file with O_RDWR (write
+          phase) or O_RDONLY (read phase) + optional O_CREAT + optional O_DIRECT.
+          No O_APPEND.
+    language: C++
+    lines: ~9000
+
+  - file: Worker.h / Worker.cpp
+    path: source/workers/Worker.h
+    purpose: Abstract base class for LocalWorker and RemoteWorker.
+    key_elements:
+      - element: isInterruptionRequested
+        type: variable
+        location: "source/workers/Worker.h:47"
+        description: >
+          std::atomic_bool. Set by WorkerManager::interruptAndNotifyWorkers() via
+          worker->interruptExecution(). Checked in checkInterruptionRequest().
+      - element: checkInterruptionRequest
+        type: function
+        location: "source/workers/Worker.cpp:74"
+        description: >
+          Throws WorkerInterruptedException if isInterruptionRequested is true.
+          Called after every block IO in rwBlockSized and every
+          INTERRUPTION_CHECK_INTERVAL iterations in the outer file loops.
+      - element: workerGotPhaseWork
+        type: variable
+        location: "source/workers/Worker.h:52"
+        description: >
+          Set to false when a worker gets no blocks assigned (e.g. more threads
+          than blocks). Workers that set this false also don't trigger stonewall.
+      - element: stoneWallTriggered
+        type: variable
+        location: "source/workers/Worker.h:51"
+        description: >
+          Captures per-file/per-ops stats when the first worker finishes a phase.
+          Relevant to append-only mode because if one thread finishes early due to
+          time expiry the stonewall fires.
+    language: C++
+    lines: 130
+
+  - file: WorkersSharedData.h / WorkersSharedData.cpp
+    path: source/workers/WorkersSharedData.h
+    purpose: Shared state across all LocalWorker threads for a single benchmark run.
+    key_elements:
+      - element: isPhaseTimeExpired
+        type: variable
+        location: "source/workers/WorkersSharedData.h:37"
+        description: >
+          Static bool. Set to true by WorkerManager::checkPhaseTimeLimit() when
+          timeLimitSecs has elapsed. Triggers interruptAndNotifyWorkers().
+      - element: gotUserInterruptSignal
+        type: variable
+        location: "source/workers/WorkersSharedData.h:36"
+        description: >
+          Static bool. Set by SIGINT/SIGTERM handler. Also triggers interruption.
+      - element: currentBenchPhase
+        type: variable
+        location: "source/workers/WorkersSharedData.h:50"
+        description: >
+          The phase enum (BenchPhase_CREATEFILES, etc.) shared by all workers.
+    language: C++
+    lines: 120
+
+  - file: WorkerManager.cpp
+    path: source/workers/WorkerManager.cpp
+    purpose: Manages thread lifecycle, phase transitions, and time-limit enforcement.
+    key_elements:
+      - element: checkPhaseTimeLimit
+        type: function
+        location: "source/workers/WorkerManager.cpp:89"
+        description: >
+          Called periodically by the main loop. Compares
+          steady_clock::now() - phaseStartT against progArgs.getTimeLimitSecs().
+          On expiry: sets isPhaseTimeExpired=true and calls interruptAndNotifyWorkers().
+      - element: interruptAndNotifyWorkersUnlocked
+        type: function
+        location: "source/workers/WorkerManager.cpp:20"
+        description: >
+          Calls worker->interruptExecution() on every worker (sets isInterruptionRequested),
+          then notifies the condition variable to wake sleeping workers.
+    language: C++
+    lines: ~230
+
+  - file: OffsetGenerator.h
+    path: source/toolkits/offsetgen/OffsetGenerator.h
+    purpose: All offset generator implementations used by rwBlockSized.
+    key_elements:
+      - element: OffsetGenSequential
+        type: class
+        location: "source/toolkits/offsetgen/OffsetGenerator.h:46"
+        description: >
+          Tracks currentOffset (starts at startOffset) and numBytesLeft (starts at len).
+          getNextOffset() returns currentOffset. addBytesSubmitted(n) increments
+          currentOffset by n and decrements numBytesLeft by n.
+          Loop exits when numBytesLeft reaches zero.
+      - element: OffsetGenReverseSeq
+        type: class
+        location: "source/toolkits/offsetgen/OffsetGenerator.h:102"
+        description: Reverse sequential -- starts from last block and walks backwards.
+      - element: OffsetGenRandom / OffsetGenRandomAligned
+        type: class
+        location: "source/toolkits/offsetgen/OffsetGenerator.h:~160"
+        description: Random offset generators. Total bytes bounded by numBytesTotal.
+      - element: getNumBytesLeftToSubmit
+        type: function
+        location: "source/toolkits/offsetgen/OffsetGenerator.h"
+        description: >
+          This is THE loop termination condition in rwBlockSized(). Returns 0 when
+          all bytes have been submitted for the current file/range.
+    language: C++
+    lines: ~400
+
+  - file: ProgArgs.h / ProgArgs.cpp
+    path: source/ProgArgs.h
+    purpose: All user-facing parameters. Source of fileSize, timeLimitSecs, doTruncate, etc.
+    key_elements:
+      - element: fileSize
+        type: variable
+        location: "source/ProgArgs.h:~420"
+        description: >
+          uint64_t. The single fixed file size used for every file in the benchmark.
+          Set by --filesize. Used to initialize all OffsetGenerators and for
+          ftruncate/fallocate. There is no "unbounded" or "no size" mode today.
+      - element: timeLimitSecs
+        type: variable
+        location: "source/ProgArgs.h:540"
+        description: >
+          size_t. Set by --timelimit. If nonzero, WorkerManager will interrupt workers
+          after this many seconds. This is the intended mechanism for duration-bounded runs.
+      - element: doInfiniteIOLoop
+        type: variable
+        location: "source/ProgArgs.h:382"
+        description: >
+          bool. Set by --infloop. Causes LocalWorker::run() to loop the current phase
+          indefinitely via do..while, restarting the file iteration each pass.
+          Does NOT change file growth behavior -- each pass rewrites [0..fileSize].
+      - element: doTruncate
+        type: variable
+        location: "source/ProgArgs.h:398"
+        description: >
+          bool (--truncate). Adds O_TRUNC to open flags and calls ftruncate(fd, 0)
+          in ProgArgs::prepareFileSize() for file/bdev mode.
+      - element: doTruncToSize
+        type: variable
+        location: "source/ProgArgs.h:399"
+        description: >
+          bool (--trunctosize). Calls ftruncate(fd, fileSize) in dirModeOpenAndPrepFile()
+          to pre-size the file before writing begins.
+      - element: doPreallocFile
+        type: variable
+        location: "source/ProgArgs.h"
+        description: >
+          bool (--preallocfile). Calls posix_fallocate(fd, 0, fileSize) in
+          dirModeOpenAndPrepFile() to preallocate blocks before writing.
+    language: C++
+    lines: ~900
+
+patterns_found:
+  - category: architecture
+    pattern: Offset generator drives write loop termination
+    description: >
+      rwBlockSized() does not check wall-clock time, byte counts, or file-size limits
+      directly -- it only loops while getNumBytesLeftToSubmit() > 0. All bounds are
+      encoded into the OffsetGenerator at construction. Changing "how much to write
+      per file invocation" requires either a new generator or modifying the reset()
+      call in the file loops.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: "1660"
+        snippet: "while(rwOffsetGen->getNumBytesLeftToSubmit() )"
+    prevalence: common
+
+  - category: architecture
+    pattern: Positional pwrite -- no lseek, no O_APPEND in write path
+    description: >
+      All writes go through pwrite() with explicit file offsets supplied by the
+      OffsetGenerator. lseek() does not appear in the write path (only appears in
+      ProgArgs::prepareFileSize() to probe block device size). O_APPEND is never
+      set on files being benchmarked.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: "2484-2497"
+        snippet: "ssize_t pwriteRes = pwrite(fd, buf, nbytes, offset);"
+    prevalence: common
+
+  - category: architecture
+    pattern: Pre-flight size commitment -- ftruncate or fallocate before IO
+    description: >
+      In dir mode, dirModeOpenAndPrepFile() optionally calls ftruncate(fd, fileSize)
+      or posix_fallocate(fd, 0, fileSize) BEFORE the write loop runs. File size is
+      thus committed to disk before any data is written. In file/bdev mode, this is
+      handled by ProgArgs::prepareFileSize() at bench path preparation time.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: "7086-7110"
+        snippet: "int truncRes = ftruncate(fd, fileSize);"
+    prevalence: common
+
+  - category: architecture
+    pattern: Short-write validation throws exception
+    description: >
+      After funcRWBlockSized() returns, both dirModeIterateFiles() and
+      fileModeIterateFilesSeq() check that writeRes == fileSize (or currentIOLen).
+      A mismatch throws WorkerException. Append-only mode, which intentionally writes
+      more or less than the initial fileSize across a duration, must bypass or
+      redefine this check.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: "3103-3110"
+        snippet: |
+          IF_UNLIKELY( (size_t)writeRes != fileSize)
+              throw WorkerException(std::string("Unexpected short file write. ") ...
+    prevalence: common
+
+  - category: architecture
+    pattern: Time-limited runs use external interruption, not an in-loop timer
+    description: >
+      Workers do not check the clock inside rwBlockSized(). The WorkerManager polls
+      checkPhaseTimeLimit() in the main thread and sets isInterruptionRequested on all
+      workers. Workers check isInterruptionRequested via checkInterruptionRequest() at
+      the end of each IO block. The granularity is one block size (up to blockSize
+      bytes may be written after the time limit before the check fires).
+    examples:
+      - file: source/workers/WorkerManager.cpp
+        location: "89-125"
+        snippet: |
+          IF_UNLIKELY(elapsedSecs >= progArgs.getTimeLimitSecs() )
+          {
+              WorkersSharedData::isPhaseTimeExpired = true;
+              interruptAndNotifyWorkers();
+          }
+    prevalence: common
+
+  - category: structure
+    pattern: funcRWBlockSized function pointer dispatches to sync or async
+    description: >
+      The actual write loop is invoked via the function pointer funcRWBlockSized,
+      set in initPhaseFunctionPointers(). This is either rwBlockSized() (sync pwrite)
+      or aioBlockSized() (libaio async). Both share the same OffsetGenerator-based
+      termination logic.
+    examples:
+      - file: source/workers/LocalWorker.cpp
+        location: "3099"
+        snippet: "int64_t writeRes = ((*this).*funcRWBlockSized)();"
+    prevalence: common
+
+related_architecture:
+  components_relevant_to_domain:
+    - component: OffsetGenerator (OffsetGenSequential, OffsetGenRandom, etc.)
+      responsibility: >
+        Tracks currentOffset and numBytesLeft for the active file range.
+        Drives the termination condition of rwBlockSized().
+      location: source/toolkits/offsetgen/OffsetGenerator.h
+      relationship_to_domain: >
+        Central. Append-only mode needs either (a) an OffsetGenUnbounded that never
+        returns 0 from getNumBytesLeftToSubmit() until interrupted, or (b) a mechanism
+        to reset/extend the generator each pass.
+
+    - component: WorkerManager
+      responsibility: >
+        Manages thread lifecycle, phase start/stop, and time-limit enforcement.
+        Periodically calls checkPhaseTimeLimit() and sets isPhaseTimeExpired +
+        calls interruptAndNotifyWorkers() when limit is reached.
+      location: source/workers/WorkerManager.cpp
+      relationship_to_domain: >
+        Termination of the append-only loop (after duration expires) will rely on
+        this existing interrupt mechanism -- no changes needed here.
+
+    - component: ProgArgs
+      responsibility: >
+        Source of all user-configured parameters: fileSize, timeLimitSecs,
+        doTruncate, doTruncToSize, doPreallocFile, doInfiniteIOLoop, blockSize, etc.
+      location: source/ProgArgs.h / source/ProgArgs.cpp
+      relationship_to_domain: >
+        A new bool flag (e.g. doAppendOnly) will live here, along with any new
+        argument definitions.
+
+    - component: WorkersSharedData
+      responsibility: Shared phase state (phase ID, done counters, time expired flag).
+      location: source/workers/WorkersSharedData.h
+      relationship_to_domain: isPhaseTimeExpired is the signal that stops workers.
+
+  interfaces_used_by_domain:
+    - interface: OffsetGenerator::getNumBytesLeftToSubmit()
+      location: source/toolkits/offsetgen/OffsetGenerator.h
+      usage_pattern: Loop-termination predicate in rwBlockSized()
+    - interface: OffsetGenerator::getNextOffset()
+      location: source/toolkits/offsetgen/OffsetGenerator.h
+      usage_pattern: Supplies pwrite() offset for each block
+    - interface: OffsetGenerator::addBytesSubmitted(n)
+      location: source/toolkits/offsetgen/OffsetGenerator.h
+      usage_pattern: Advances generator state after each successful write
+    - interface: Worker::checkInterruptionRequest()
+      location: source/workers/Worker.cpp:74
+      usage_pattern: >
+        Called at end of each block write in rwBlockSized() and every 128 iterations
+        in outer file loops. Throws WorkerInterruptedException on interruption.
+
+  data_flow_involving_domain: >
+    ProgArgs.fileSize → initPhaseRWOffsetGen (constructs OffsetGenSequential(fileSize, 0, blockSize))
+    → rwOffsetGen held as unique_ptr in LocalWorker
+    → dirModeIterateFiles() calls rwOffsetGen->reset() before each file, then funcRWBlockSized()
+    → rwBlockSized() calls getNextOffset()/getNumBytesLeftToSubmit()/addBytesSubmitted()
+    → pwriteWrapper() calls pwrite(fd, buf, blockSize, currentOffset)
+    → atomicLiveOps.numBytesDone += rwRes (live stats)
+
+  key_relationships_to_domain:
+    - from: dirModeIterateFiles
+      to: rwBlockSized
+      relationship: calls (via funcRWBlockSized function pointer)
+    - from: fileModeIterateFilesSeq
+      to: rwBlockSized
+      relationship: calls (via funcRWBlockSized function pointer)
+    - from: rwBlockSized
+      to: pwriteWrapper
+      relationship: calls (via funcPositionalWrite function pointer)
+    - from: rwBlockSized
+      to: OffsetGenSequential
+      relationship: reads/mutates (getNextOffset, addBytesSubmitted)
+    - from: WorkerManager::checkPhaseTimeLimit
+      to: Worker::isInterruptionRequested
+      relationship: sets (via interruptExecution)
+    - from: rwBlockSized
+      to: Worker::checkInterruptionRequest
+      relationship: calls (per-block)
+
+related_technology_stack:
+  languages_used_in_domain:
+    - C++17
+  frameworks_used_in_domain:
+    - name: libaio (optional)
+      usage_in_domain: Async IO variant in aioBlockSized(); same offset-gen termination logic.
+  libraries_used_in_domain:
+    - name: POSIX pwrite/pread
+      purpose_in_domain: Synchronous positional write and read syscalls used in all IO paths.
+    - name: posix_fallocate
+      purpose_in_domain: Optional pre-allocation of file blocks before write loop starts.
+
+related_conventions:
+  naming_patterns_in_domain: >
+    Functions taking a phase-dependent action are stored as function pointers (funcRWBlockSized,
+    funcPositionalWrite, etc.) and selected in initPhaseFunctionPointers(). Phase-level init
+    follows initPhase*() naming.
+  structure_of_domain: >
+    Each LocalWorker is a single thread. Phase dispatch happens in run() switch statement.
+    Per-file open/prep is done in dirModeOpenAndPrepFile(); IO is in rwBlockSized().
+    All mutable per-file state (fd, cuFileHandle, mmapPtr) lives in fileHandles struct.
+  error_handling_in_domain: >
+    Worker errors throw WorkerException. Short writes are checked post-call and throw.
+    WorkerInterruptedException is a separate class that flows up through run() without
+    incrementing the error counter.
+  testing_in_domain: Covered by tools/test-examples.sh (shell-based integration tests, no unit tests).
+  documentation_in_domain: docs/csv-docs.md, docs/result-columns-explanation.md, docs/usage/help*.md.
+
+related_dependencies:
+  internal:
+    - component: ProgArgs
+      relationship_to_domain: Supplies all config parameters (fileSize, blockSize, flags)
+      direction: inbound
+    - component: OffsetGenerator hierarchy
+      relationship_to_domain: Drives write offset and termination for rwBlockSized
+      direction: inbound
+    - component: WorkerManager / WorkersSharedData
+      relationship_to_domain: Controls phase start/stop and interruption
+      direction: inbound
+  external:
+    - name: POSIX pwrite
+      purpose_for_domain: Core write syscall
+    - name: posix_fallocate / ftruncate
+      purpose_for_domain: Pre-flight file sizing before write loop
+
+open_questions:
+  - question: >
+      For append-only mode, should file size tracking be per-file or per-worker?
+    context: >
+      In dir mode, one file is open at a time per worker. If a worker appends for a
+      duration and then closes, file sizes will differ across workers. Stats tracking
+      (atomicLiveOps.numBytesDone) aggregates bytes written across all files -- this
+      should still work, but the per-file "total" reported in results may be ambiguous.
+
+  - question: >
+      Does the short-write validation in dirModeIterateFiles and fileModeIterateFilesSeq
+      need to be suppressed entirely, or just changed to "any write is acceptable"?
+    context: >
+      The current check is: IF_UNLIKELY( (size_t)writeRes != fileSize). In append mode
+      the write loop will be interrupted mid-file, making writeRes < fileSize. The check
+      must be either removed or conditioned on !doAppendOnly.
+
+  - question: >
+      Should O_APPEND be set, or should the new mode track the current end-of-file offset
+      explicitly (via fstat or a local variable) and pass it to pwrite()?
+    context: >
+      O_APPEND makes the kernel atomically append but means pwrite() ignores the supplied
+      offset. The offset generator infrastructure would not work with O_APPEND. The cleanest
+      approach is probably a new OffsetGenUnbounded that grows currentOffset each call
+      without a numBytesLeft limit, letting the time-limit interrupt mechanism stop it.
+
+  - question: >
+      Should ftruncate / fallocate be skipped entirely for append-only files, or should
+      a starting size still be committed?
+    context: >
+      Currently doTruncToSize calls ftruncate(fd, fileSize) before the write loop.
+      In append-only mode there is no meaningful pre-known "fileSize", so this should
+      be skipped. The file should start at 0 bytes (or its current size if pre-existing).
+
+  - question: >
+      How are results reported when different workers write different amounts?
+    context: >
+      The stonewall mechanism records stats when the first worker finishes. In append-only
+      + time-limited mode, all workers are interrupted at the same time, so stonewall
+      will fire when the first worker processes the interrupt signal. Results should
+      still be valid aggregate bytes-per-second, but per-file size will vary.
+
+gaps:
+  - area: aioBlockSized (libaio async path)
+    description: >
+      aioBlockSized was not read line-by-line. It was confirmed to use the same
+      OffsetGenerator-driven loop and the same checkInterruptionRequest() mechanism.
+      The precise async submission/reaping loop and any differences in short-write
+      handling were not verified.
+    impact: >
+      Append-only mode may need the same modifications in aioBlockSized as in rwBlockSized.
+      Low risk -- the same offset gen is shared, so the termination change should
+      propagate naturally.
+
+  - area: S3 and HDFS write paths
+    description: >
+      s3ModeIterateObjects() and hdfsDirModeIterateFiles() were not analyzed. They have
+      different object/file semantics and likely different size handling.
+    impact: >
+      Append-only mode is likely a POSIX filesystem feature only. S3/HDFS paths are
+      out of scope for append-only mode and can be explicitly excluded via a check
+      against benchPathType / getS3EndpointsVec().empty().
+
+  - area: Custom tree mode (dirModeIterateCustomFiles)
+    description: >
+      dirModeIterateCustomFiles() was not read in detail. It uses a PathStore-based
+      iteration over an explicit file list rather than generated names.
+    impact: >
+      Append-only mode might be incompatible with custom tree mode (where file sizes
+      may be pre-specified per-file). Low priority for initial implementation.
+
+  - area: ProgArgs::prepareFileSize in file/bdev mode
+    description: >
+      This function validates that fileSize > 0 and that existing files are >= fileSize.
+      These validations will reject a "fileSize=0 means unbounded" approach.
+    impact: >
+      Append-only mode must either add a new "noFileSize" flag that bypasses these checks,
+      or validate that --timelimit is set and skip the file-size checks when doAppendOnly is true.

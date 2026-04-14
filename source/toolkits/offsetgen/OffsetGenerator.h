@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <random>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -14,6 +15,7 @@
 
 #include "Common.h"
 #include "ProgArgs.h"
+#include "ProgException.h"
 #include "toolkits/random/RandAlgoRange.h"
 
 #define OFFSETGEN_FULLCOV_PRIME      (2147483647)
@@ -375,6 +377,66 @@ class OffsetGenStrided : public OffsetGenerator
             numBytesLeft -= numBytes;
             currentOffset += (blockSize * numDataSetThreads);
         }
+};
+
+/**
+ * Offset generator for unbounded sequential append-only writes.
+ *
+ * getNumBytesLeftToSubmit() always returns a large sentinel value so the worker loop in
+ * rwBlockSized() never exits due to exhaustion; the loop exits only when
+ * isInterruptionRequested() fires (time limit expiry).
+ *
+ * startOffset should be the current EOF of the file at open time.
+ */
+class OffsetGenUnbounded : public OffsetGenerator
+{
+    public:
+        OffsetGenUnbounded(uint64_t blockSize, int64_t startOffset) :
+            blockSize_(blockSize), startOffset_(startOffset), currentOffset_(startOffset)
+        { }
+
+        virtual ~OffsetGenUnbounded() {}
+
+    private:
+        uint64_t blockSize_;
+        int64_t  startOffset_;
+        int64_t  currentOffset_;
+
+    // inliners
+    public:
+        virtual void reset() override
+            { currentOffset_ = startOffset_; }
+
+        virtual void reset(uint64_t len, uint64_t offset) override
+        {
+            startOffset_ = static_cast<int64_t>(offset);
+            currentOffset_ = startOffset_;
+        }
+
+        virtual uint64_t getNextOffset() override
+        {
+            if(currentOffset_ > std::numeric_limits<int64_t>::max() / 2)
+                throw ProgException("OffsetGenUnbounded: offset overflow; append-only write "
+                    "exceeded safe offset range");
+            uint64_t ret = static_cast<uint64_t>(currentOffset_);
+            currentOffset_ += static_cast<int64_t>(blockSize_);
+            return ret;
+        }
+
+        virtual size_t getBlockSize() const override
+            { return static_cast<size_t>(blockSize_); }
+
+        virtual size_t getNextBlockSizeToSubmit() const override
+            { return static_cast<size_t>(blockSize_); }
+
+        virtual uint64_t getNumBytesTotal() const override
+            { return static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 2); }
+
+        virtual uint64_t getNumBytesLeftToSubmit() const override
+            { return static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 2); }
+
+        virtual void addBytesSubmitted(size_t numBytes) override
+            { /* no-op: offset is advanced in getNextOffset() */ }
 };
 
 #endif /* OFFSETGENERATOR_H_ */
