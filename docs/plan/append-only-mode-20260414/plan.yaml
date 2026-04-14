@@ -8,7 +8,8 @@ objective: |
   Works in directory mode only.
 created_at: "2026-04-14"
 created_by: gem-planner
-status: pending_approval
+status: completed
+last_executed_task: T05
 branch: feat/append-only-mode
 research_confidence: high
 
@@ -78,7 +79,9 @@ tasks:
     title: Add --appendonly flag to ProgArgs
     agent: gem-implementer
     depends_on: []
-    status: pending
+    status: completed
+    merged_at: "2026-04-14"
+    commit: 9340e8c
     priority: high
     estimated_effort: small
     estimated_files: 2
@@ -139,7 +142,9 @@ tasks:
     title: Add OffsetGenUnbounded to OffsetGenerator.h
     agent: gem-implementer
     depends_on: []
-    status: pending
+    status: completed
+    merged_at: "2026-04-14"
+    commit: 9340e8c
     priority: high
     estimated_effort: small
     estimated_files: 1
@@ -188,7 +193,9 @@ tasks:
     depends_on:
       - T01
       - T02
-    status: pending
+    status: completed
+    merged_at: "2026-04-14"
+    commit: 9340e8c
     priority: high
     estimated_effort: medium
     estimated_files: 2
@@ -263,7 +270,8 @@ tasks:
       - T01
       - T02
       - T03
-    status: pending
+    status: completed
+    merged_at: "2026-04-14"
     priority: high
     estimated_effort: small
     estimated_files: 5
@@ -308,7 +316,8 @@ tasks:
     agent: gem-implementer
     depends_on:
       - T04
-    status: pending
+    status: completed
+    merged_at: "2026-04-14"
     priority: high
     estimated_effort: small
     estimated_files: 0
