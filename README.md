@@ -12,6 +12,7 @@ elbencho was inspired by traditional storage benchmark tools like [fio](https://
 
 - [Features](#features)
 - [Usage](#usage)
+  - [Append-Only Mode](#append-only-mode)
 - [Build Prerequisites](#build-prerequisites)
   - [Dependencies for Debian/Ubuntu](#dependencies-for-debianubuntu)
   - [Dependencies for RHEL/CentOS](#dependencies-for-rhelcentos)
@@ -38,12 +39,29 @@ elbencho was inspired by traditional storage benchmark tools like [fio](https://
 * Results by first and by last finished thread
 * CSV file output to easily create graphs in spreadsheet apps or via elbencho-chart tool
 * Data integrity verification option
+* Append-only mode for time-bounded unbounded file growth benchmarking (`--appendonly`)
 
 ## Usage
 
 The [built-in help](docs/usage/help.md) (`elbencho --help`) provides simple examples to get started.
 
 You can get elbencho pre-built for Linux & Windows from the [Releases section](https://github.com/breuner/elbencho/releases) and from [Docker Hub](https://hub.docker.com/r/breuner/elbencho).
+
+Pre-built packages for Ubuntu 22.04 (.deb) and Rocky Linux 9 / RHEL 9 (.rpm) with append-only mode are available in the [elliottecton/elbencho releases](https://github.com/elliottecton/elbencho/releases).
+
+### Append-Only Mode
+
+The `--appendonly` flag enables time-bounded unbounded file growth benchmarking. Workers open existing or new files at current EOF and write continuously until `--timelimit` fires. Files grow without pre-sizing; total bytes written and throughput are reported at exit.
+
+```bash
+elbencho --appendonly --timelimit 30 -n 4 --block 1m /mnt/target
+```
+
+Requirements and constraints:
+- `--timelimit` is required (omitting it is an error)
+- Directory mode only (`--sharedfile` is incompatible)
+- Read and verify phases are incompatible; `--size` is ignored
+- `--num`/`-n` controls the number of files; each file is assigned to one worker
 
 ## Build Prerequisites
 
